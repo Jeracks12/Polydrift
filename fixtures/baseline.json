@@ -1,0 +1,31 @@
+{
+  "frozen_ts": 1784480173.503402,
+  "frozen_at": "2026-07-20 00:56:13",
+  "files": {
+    "session_20260720_002353.jsonl.gz": {
+      "avg_pnl_c": null,
+      "drift_n": 0,
+      "evaluated": 0,
+      "fav_n": 0,
+      "hit_pct": null,
+      "sigs": 0,
+      "wins": 0
+    },
+    "session_20260720_004508.jsonl.gz": {
+      "avg_pnl_c": null,
+      "drift_n": 0,
+      "evaluated": 0,
+      "fav_n": 0,
+      "hit_pct": null,
+      "sigs": 0,
+      "wins": 0
+    }
+  },
+  "total": {
+    "sigs": 0,
+    "evaluated": 0,
+    "wins": 0,
+    "hit_pct": null,
+    "avg_pnl_c": null
+  }
+}

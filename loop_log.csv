@@ -1,0 +1,3 @@
+phase,turns_used,turn_budget,checks,receipt,no_rate,valve_fires,notes
+P0,9,12,4/4,"RECEIPT verified checks=4/4 replay_sigs=1 hit=100% netEdge=0.5c",0,0,"lookahead bug found+fixed in grid_vol by no-lookahead test; baseline frozen: sigs=2 hit=50% avg=-6.0c across 2 fixtures"
+AUDIT,12,14,5/5,"RECEIPT audit checks=5/5 findings=25 high=8",0,0,"25/25 cells FINDING (high=8 med=9 low=8); 4 repro asserts self-corrected during loop (A1 fat-tail narrowed, A3 probe fixed, B5 strengthened, D3 estimand reframed); alignment of beta lag-shift verified CORRECT as side-result; fix order seeded in ledger adversarial section"

@@ -1,0 +1,43 @@
+# ---------------------------------------------------------------------------
+# SECRETS — never commit. .env holds the live signer private key.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# ---------------------------------------------------------------------------
+# Recorded market data and run logs. data/ alone is ~1.6 GB and grows every
+# session; these are reproducible artefacts, not source. fixtures/ IS tracked
+# because scripts/gate.py replays it to prove determinism.
+# ---------------------------------------------------------------------------
+data/
+logs/
+scratch/
+*.jsonl
+*.jsonl.gz
+!fixtures/*.jsonl.gz
+
+# research / run outputs
+signals*.csv
+paper_trades.csv
+market_state*.csv
+*.parquet
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# ---------------------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
