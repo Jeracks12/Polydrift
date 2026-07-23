@@ -126,11 +126,17 @@ def test_fade_ignores_the_lead_requirement_but_catchup_does_not():
     assert len(an.signals) == 0 and an.last_gate == 'no_leading_ref'
 
 
-def test_rt_gate_requires_edge_above_live_spread():
-    """Required edge = max(MIN_EDGE floor, live spread). Control P(up) to isolate the gate."""
+def test_rt_gate_requires_edge_above_live_spread_and_the_real_taker_fee():
+    """Required edge = max(MIN_EDGE floor, spread + taker fee + buffer). Control P(up) to
+    isolate the gate.
+
+    The fee is NOT optional decoration: Polymarket charges takers
+    `0.07 * p * (1-p)` per share on these markets (gamma-api `feeSchedule`,
+    `crypto_fees_v2`). At the 0.34 ask that is 1.57c/share -- a third of the whole
+    requirement here, and larger than the measured gross edge of the strategy."""
     now = 1000.0
 
-    def run(target_edge, rt_gate):
+    def run(target_edge, rt_gate, fee_rate=0.07, exit_enable=0):
         an = fresh(now)
         pdft.POLY_BOOK.bids = {0.30: 500}; pdft.POLY_BOOK.asks = {0.34: 500}   # 4c spread, ba=0.34
         pdft.FEEDS['poly'] = pdft.Feed('poly'); pdft.FEEDS['poly'].quotes.append((now, 0.32))
@@ -140,6 +146,7 @@ def test_rt_gate_requires_edge_above_live_spread():
         # floor (0.12 * 0.34 = 0.041) would otherwise bind first and mask it.
         pdft.CFG.update(MIN_EDGE=0.03, MIN_MODEL_P=0.0, RT_GATE=rt_gate, MIN_EDGE_ROI=0.0,
                         RT_SPREAD_MULT=1.0, RT_FEE_C=0.0, RT_BUFFER_C=0.5,
+                        FEE_RATE_TAKER=fee_rate, FEE_EXPONENT=1, EXIT_ENABLE=exit_enable,
                         FAIR_SOURCE='model')   # injecting P(up) directly, so use it as fair
         pup = 0.34 + target_edge                                # edge_up = pup - ask = target
         an._model_p_win = lambda side, t: pup if side == 'BUY' else 1 - pup
@@ -148,10 +155,30 @@ def test_rt_gate_requires_edge_above_live_spread():
         an._signal(stats, {'spot': 3.0}, now)
         return len(an.signals)
 
-    assert run(0.035, rt_gate=1) == 0    # clears 3c floor but NOT the 4.5c live spread
-    assert run(0.050, rt_gate=1) == 1    # clears the spread-driven requirement
+    # spread 0.040 + fee 0.0157 + buffer 0.005 = 0.0607 required
+    assert run(0.050, rt_gate=1) == 0    # clears the OLD fee-free 4.5c bar, not the real one
+    assert run(0.070, rt_gate=1) == 1    # clears spread + fee + buffer
     assert run(0.035, rt_gate=0) == 1    # RT off -> only the fixed floor
-    pdft.CFG.update(MIN_MODEL_P=0.20, RT_GATE=0, MIN_EDGE_ROI=0.12)
+    # the fee is exactly what moved the bar: zero it and the old 4.5c requirement returns
+    assert run(0.050, rt_gate=1, fee_rate=0.0) == 1
+    # an early exit is a SECOND taker trade, so it must be charged a second fee; settlement
+    # is not a trade and is charged once (the leg count follows EXIT_ENABLE)
+    assert run(0.070, rt_gate=1, exit_enable=1) == 0     # 0.040 + 2*0.0157 + 0.005 = 0.0764
+    assert run(0.080, rt_gate=1, exit_enable=1) == 1
+    pdft.CFG.update(MIN_MODEL_P=0.20, RT_GATE=0, MIN_EDGE_ROI=0.12, EXIT_ENABLE=0)
+
+
+def test_taker_fee_matches_the_published_schedule():
+    """Regression pin on the fee model itself. Polymarket's documented worked examples:
+    100 shares at $0.50 -> $1.75; at $0.30 or $0.70 -> $1.47."""
+    from drift_math import taker_fee
+    assert abs(taker_fee(0.50) * 100 - 1.75) < 1e-9
+    assert abs(taker_fee(0.30) * 100 - 1.47) < 1e-9
+    assert abs(taker_fee(0.30) - taker_fee(0.70)) < 1e-15     # symmetric in YES/NO
+    assert taker_fee(0.5, rate=0.0) == 0.0
+    # as a FRACTION OF CAPITAL the fee is worst on cheap shares -- the opposite of what
+    # MIN_EDGE_ROI's reward:risk argument assumes
+    assert taker_fee(0.10) / 0.10 > taker_fee(0.90) / 0.90
 
 
 def test_settles_at_cycle_close_when_known():
@@ -185,16 +212,40 @@ def test_model_p_win_feasibility_by_time_left():
     assert an._model_p_win('BUY', now) > p1
 
 
-def test_model_p_win_calibration_pulls_tails_in():
+def test_model_p_win_logit_calibration_moves_the_tail():
+    """CALIB_MODE='logit' path only. Note the DEFAULT is now 'empirical', which ignores the
+    slope entirely — so this test must opt in or it silently tests nothing."""
     now = 1000.0
     an = fresh(now)
     an.snap = {'px': {'spot': spot_series(bp_from_strike=40.0)}}
     pdft.ROLL.update(strike=100.0, strike_ref='spot', end=now + 120)
-    pdft.CFG['CALIB_SLOPE'] = 1.0
+    pdft.CFG.update(CALIB_MODE='logit', CALIB_SLOPE=1.0)
     raw = an._model_p_win('BUY', now)
     pdft.CFG['CALIB_SLOPE'] = 0.9
-    cal = an._model_p_win('BUY', now)
-    assert cal < raw and cal > 0.5                 # slope<1 pulls an extreme prob toward 0.5
+    soft = an._model_p_win('BUY', now)
+    pdft.CFG['CALIB_SLOPE'] = 1.5
+    sharp = an._model_p_win('BUY', now)
+    assert soft < raw < sharp and soft > 0.5    # <1 compresses toward 0.5, >1 sharpens
+    pdft.CFG.update(CALIB_MODE='empirical', CALIB_SLOPE=1.5)
+
+
+def test_empirical_calibration_is_the_default_and_beats_the_gaussian_in_the_body():
+    """The measured table disagrees with Phi() by up to ~11 points at the moneyness these
+    5-minute markets actually trade (+-10bp of the strike). Phi() is UNDER-confident there:
+    it says 0.695 at +10bp where 104k real cycles say 0.807. That gap is ~4x MIN_EDGE, so
+    which pricer is wired in is worth more than any threshold in CFG."""
+    from drift_math import empirical_p_up, binary_p_up
+    assert pdft.CFG['CALIB_MODE'] == 'empirical'
+    K, sig, tau = 100000.0, 0.00016, 150.0
+    for bp, direction in ((10.0, 'up'), (-10.0, 'down')):
+        S = K * (1 + bp / 1e4)
+        g, e = binary_p_up(S, K, sig, tau), empirical_p_up(S, K, sig, tau)
+        assert abs(e - g) > 0.08, f'{bp}bp: expected a large disagreement, got {e-g:+.3f}'
+        assert (e > g) if direction == 'up' else (e < g)   # empirical is SHARPER, not softer
+    # monotone in moneyness, and clamped outside the fitted range rather than extrapolated
+    xs = [empirical_p_up(K * (1 + b / 1e4), K, sig, tau) for b in range(-60, 61, 5)]
+    assert all(b >= a - 1e-12 for a, b in zip(xs, xs[1:]))
+    assert empirical_p_up(K * 10, K, sig, tau) == empirical_p_up(K * 100, K, sig, tau)
 
 
 def test_feasibility_gate_absent_without_strike():

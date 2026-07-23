@@ -21,6 +21,7 @@ scratch/
 signals*.csv
 paper_trades.csv
 market_state*.csv
+maker_latency*.csv
 *.parquet
 
 # ---------------------------------------------------------------------------
