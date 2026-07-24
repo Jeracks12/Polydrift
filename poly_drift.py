@@ -612,12 +612,22 @@ class Analytics:
                     sigma = max(sigma, fast)
         q = FEEDS['poly'].quotes
         fresh = bool(q) and (now - q[-1][0]) <= CFG['POLY_STALE_S']
+        # ANCHOR. Prefer the strike model probability: it depends only on S/K/sigma/tau, never on
+        # the poly mid, so quoting around it is not circular (audit M6).
+        #
+        # Critically, do NOT require self.fair. _fair_value() returns None whenever the drift
+        # residual is unavailable (no leading ref) or DISAGREES with the model -- an agreement
+        # filter that earns its keep for a taker taking conviction bets, but for a maker it is
+        # pure lost quoting time. Measured on 2026-07-24 (5,085 ticks / 22 cycles): the model
+        # probability was computable on 65.9% of ticks but self.fair existed on only 29.4%, so
+        # the maker sat out 1,873 ticks it could have quoted -- 70.5% of the session was
+        # 'no_fair'. Fall back to the model directly, exactly as _write_state already does.
         fv = self.fair
-        anchor = None
-        if fv:
-            anchor = fv.get('model_p')            # independent of the poly mid
-            if anchor is None:
-                anchor = fv.get('fair')           # no strike -> fall back to the blended fair
+        anchor = fv.get('model_p') if fv else None
+        if anchor is None:
+            anchor = self._model_p_win('BUY', now)    # trusted strike is all this needs
+        if anchor is None and fv:
+            anchor = fv.get('fair')                   # last resort: the blended drift fair
         self.maker_input = dict(fair=anchor, sigma=(sigma or 0.0), tau=tau, z=z,
                                 fresh=fresh, slug=ROLL['slug'], ts=now)
         self.last_gate = 'MAKER_' + ((MAKER.pulled_reason if MAKER else None) or 'quoting')
@@ -1368,62 +1378,108 @@ def _interactive_menu(args):
     args.record = input("record session data? [Y/n]: ").strip().lower() not in ('n', 'no')
     if input("tune indicator settings? (trigger sensitivity) [y/N]: ").strip().lower() in ('y', 'yes'):
         print("  these control HOW OFTEN drift fires. Lower z / lower corr = more signals.")
-        def _num(prompt, cur, cast=float):
+        def _rec(rec):
+            if rec: print(f"      rec: {rec}")
+        def _num(prompt, cur, cast=float, rec=None):
+            _rec(rec)
             v = input(f"  {prompt} [{cur}]: ").strip()
             try: return cast(v) if v else None
             except ValueError: return None
-        def _pick(prompt, cur, choices):
+        def _pick(prompt, cur, choices, rec=None):
+            _rec(rec)
             v = input(f"  {prompt} {choices} [{cur}]: ").strip().lower()
             return v if v in choices else None
+        print("  'rec:' = what the recorded evidence supports. Where it differs from the current")
+        print("  default the reason is given. Enter keeps the default.")
         print("  fair value = where the EXCHANGE says poly should be (drift, no strike needed),")
         print("  the strike binary model, or 'both' = only trade when they agree.")
         args.fair_source = _pick("fair value source (FAIR_SOURCE)", CFG['FAIR_SOURCE'],
-                                 ['drift', 'model', 'both'])
+                                 ['drift', 'model', 'both'],
+                                 rec="both — agreement was the single biggest filter "
+                                     "(+11.4% vs -18.6% EV/$, n=965)")
         print("  which dislocation:  catchup = exchange moved first, poly has not repriced")
         print("                      fade    = poly moved first, exchange did not follow (cheap)")
         args.scenario = _pick("scenario (SCENARIO_MODE)", CFG['SCENARIO_MODE'],
-                              ['both', 'catchup', 'fade'])
-        args.drift_z = _num("robust-z trigger (DRIFT_Z_ALERT)", CFG['DRIFT_Z_ALERT'])
-        args.min_corr = _num("min |corr| to count as leading (MIN_CORR)", CFG['MIN_CORR'])
+                              ['both', 'catchup', 'fade'],
+                              rec="both — on 5 never-seen sessions 'both' beat 'catchup' "
+                                  "(+10.7% vs +8.0%) on 4x the sample; 'catchup' looks fitted")
+        args.drift_z = _num("robust-z trigger (DRIFT_Z_ALERT)", CFG['DRIFT_Z_ALERT'],
+                            rec="2.0 — passes ~21% of ticks (2026-07-24, n=5085). "
+                                "Frequency knob; |z| showed NO monotone link to profit")
+        args.min_corr = _num("min |corr| to count as leading (MIN_CORR)", CFG['MIN_CORR'],
+                             rec="0.15 — but it is a NO-OP: 99.8% of ticks already pass "
+                                 "(1st pctile of |corr| is 0.21). Raise to ~0.45 to bind")
         args.corr_sign = _num("corr sign  1=positive only  0=either(incl. decoupled)  -1=negative",
-                              CFG['CORR_SIGN'], int)
-        args.min_edge = _num("required model edge (MIN_EDGE)", CFG['MIN_EDGE'])
+                              CFG['CORR_SIGN'], int,
+                              rec="1 — the Up leg should co-move POSITIVELY with the exchange")
+        args.min_edge = _num("required model edge (MIN_EDGE)", CFG['MIN_EDGE'],
+                             rec="0.03 — but RT_GATE now adds the real taker fee on top, "
+                                 "so the effective floor is ~0.06 near the money")
+        print("  VOL_Z_MIN is the gate that actually binds: on 2026-07-24 only 9.2% of ticks")
+        print("  cleared 1.5 (it sits ABOVE the 90th percentile of vol_z), and the full taker")
+        print("  chain passed just 2.3% of ticks -> zero signals all session.")
+        args.vol_z_min = _num("min volume z to confirm the move (VOL_Z_MIN)", CFG['VOL_Z_MIN'],
+                              rec="1.5 to stay selective, ~0.0 if you want signals at all "
+                                  "(0.0 passes ~28% of ticks). This is a FREQUENCY choice")
         print("  reward:risk — an 88c share risks $7.30 to make $1, so a 3c edge there is a")
         print("  3.4% return on a 100% downside. This asks the edge to be a minimum FRACTION")
         print("  of what you pay. 0.06 = mild, 0.12 = rejects that 88c/7.5c trade, 0 = off.")
         args.min_edge_roi = _num("min edge as a fraction of price paid (MIN_EDGE_ROI)",
-                                 CFG['MIN_EDGE_ROI'])
+                                 CFG['MIN_EDGE_ROI'],
+                                 rec="0.06 — note the fee is worst on CHEAP shares (6.3% of "
+                                     "capital at 0.10 vs 0.7% at 0.90), which cuts against it")
         print("  vol-spike guard: when the tape accelerates, trailing vol understates the next")
         print("  tau and P_up gets overconfident exactly where shares are dearest.")
         args.vol_spike_guard = _num("vol-spike guard 1=on 0=off (VOL_SPIKE_GUARD)",
-                                    CFG['VOL_SPIKE_GUARD'], int)
+                                    CFG['VOL_SPIKE_GUARD'], int,
+                                    rec="1 — sigma is measured on a 1s grid and under-reads "
+                                        "real vol; being wrong toward 0.5 only costs a skip")
     m = input("trading mode: 1) off - signals only  2) paper  3) live [Enter=1]: ").strip() or '1'
     args.mode = {'1': 'off', '2': 'paper', '3': 'live'}.get(m, 'off')
     if args.mode != 'off':
         print("  strategy: TAKER crosses the spread on a signal (pays the ~1.75c/share taker")
         print("  fee, which is larger than the measured taking edge). MAKER rests two-sided")
         print("  quotes around fair value and pays NO fee, but only earns if it gets filled.")
+        print("      rec: 2 (maker) — net of the real fee every TAKER design was NEGATIVE")
+        print("           (-0.7% pooled / -2.2% holdout); only maker-entry designs were")
+        print("           positive. Neither is proven; maker is the only one that can be.")
         strat = input("strategy: 1) taker  2) maker (resting quotes) [Enter=1]: ").strip() or '1'
         if strat == '2':
             args.maker = True
             print("  MAKER sizing is in SHARES (exchange min 5), NOT stake $: 5 sh is ~$2.50 of")
             print("  risk at 0.50. Quotes anchor to the strike model; big |z| = informed flow,")
             print("  so the bot PULLS its quotes rather than trading into it.")
+            print("      rec: 5 — the exchange minimum. NOTE median top-of-book depth today was")
+            print("           407 shares, so a 5-share quote sits deep in the queue; size does")
+            print("           not improve priority, only price does.")
             try: args.maker_shares = float(input("  shares to rest per side [5]: ").strip() or '5')
             except ValueError: args.maker_shares = 5.0
+            print("      rec: 2.5 — pulled on 15.1% of ticks today. LOWER = safer but less")
+            print("           quoting time; the cancel takes ~1.4s to reach the exchange, so")
+            print("           this cannot outrun a fast taker. Verify with scripts/markout.py.")
             try: args.maker_toxic_z = float(input("  pull all quotes when |robust z| >= this [2.5]: ").strip() or '2.5')
             except ValueError: args.maker_toxic_z = 2.5
+            print("      rec: 1.0 — heuristic, not fitted. The textbook A-S skew is ~0.0002c")
+            print("           here (numerically dead vs a 1c tick), so this IS the control.")
             try: args.maker_inv_skew_ticks = float(input("  inventory lean toward offloading, in ticks at the cap [1]: ").strip() or '1')
             except ValueError: args.maker_inv_skew_ticks = 1.0
+            print("      rec: 10 — covers maker fills too now; a 5-share quote at 0.50 is")
+            print("           $2.50 of risk per side, so $10 is ~4 quotes deep.")
             try: args.max_daily_loss = float(input("  max daily loss (kill switch), USD [10]: ").strip() or '10')
             except ValueError: args.max_daily_loss = 10.0
         else:
+            print("      rec: 1 (market) — limit orders are share-based with a 5-share minimum,")
+            print("           so they ignore your stake and risk 5 x price instead.")
             o = input("execution: 1) market - spends stake $ exactly  2) limit - shares at BBO [Enter=1]: ").strip() or '1'
             args.order = 'limit' if o == '2' else 'market'
+            print("      rec: 1 — start at the $1 exchange minimum until markout is measured.")
             try: args.stake = float(input("stake per trade, USD [1]: ").strip() or '1')
             except ValueError: args.stake = 1.0
             try: args.max_daily_loss = float(input("max daily loss (kill switch), USD [10]: ").strip() or '10')
             except ValueError: args.max_daily_loss = 10.0
+            print("      rec: n — an early exit is a SECOND taker fee (~1.7c/share). Pooled")
+            print("           n=1185, every TP level 2c-20c scored the same, so the level is")
+            print("           not a real knob; holding avoids the second fee.")
             ex = input("exit management? scalp: take-profit + thesis-invalidation "
                        "instead of hold-to-resolution [y/N]: ").strip().lower() in ('y', 'yes')
             args.exit_mgmt = ex
@@ -1625,6 +1681,10 @@ def main():
                          '(CFG MIN_EDGE_ROI, default 0.06; 0 = off). Raises the bar on '
                          'expensive shares, where a small edge is a poor return against a '
                          '100%% downside. Use 0.12 to reject an 88c share with a 7.5c edge')
+    ap.add_argument('--vol-z-min', type=float, default=None,
+                    help='min volume z to confirm a move (CFG VOL_Z_MIN, default 1.5). THE '
+                         'binding gate: measured 2026-07-24 only 9.2%% of ticks cleared 1.5, '
+                         'and the full chain passed 2.3%% -> zero signals. Lower for frequency')
     ap.add_argument('--vol-spike-guard', type=int, choices=[0, 1], default=None,
                     help='1 = never let the model be more confident than the FAST realized-vol '
                          'window justifies (sigma := max(slow, fast)); 0 = trailing window only '
@@ -1697,6 +1757,7 @@ def main():
                      ('ENTRY_MAX_PX', args.entry_max_px),
                      ('MIN_EDGE_ROI', args.min_edge_roi),
                      ('FEE_RATE_TAKER', args.fee_rate), ('RT_GATE', args.rt_gate),
+                     ('VOL_Z_MIN', args.vol_z_min),
                      ('VOL_SPIKE_GUARD', args.vol_spike_guard),
                      ('FAIR_SOURCE', args.fair_source), ('SCENARIO_MODE', args.scenario),
                      ('FADE_TAU_MIN', args.fade_tau_min), ('FADE_TAU_MAX', args.fade_tau_max),

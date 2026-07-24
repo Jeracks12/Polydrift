@@ -14,7 +14,7 @@ def run_menu(answers, coins=('btc', 'eth', 'sol')):
                                  mode='off', order='market', stake=1.0, max_daily_loss=10.0,
                                  exit_mgmt=None, exit_tp=None,
                                  drift_z=None, min_corr=None, corr_sign=None, min_edge=None,
-                                 fair_source=None, scenario=None,
+                                 fair_source=None, scenario=None, vol_z_min=None,
                                  maker=False, maker_shares=5.0, maker_toxic_z=2.5,
                                  maker_inv_skew_ticks=1.0, maker_gamma=3.0, maker_kappa=100.0)
     it = iter(answers)
@@ -161,16 +161,19 @@ def test_main_publishes_executor_for_the_signal_engine(monkeypatch):
 def test_menu_tunes_reward_risk_and_vol_spike_guard():
     """The indicator branch must expose the reward:risk and vol-spike knobs at runtime, so
     tuning them never means editing the source."""
-    a = run_menu(['1', '', 'y', 'drift', 'fade', '2.5', '0.2', '1', '0.04', '0.12', '0', 'n', ''])
+    a = run_menu(['1', '', 'y', 'drift', 'fade', '2.5', '0.2', '1', '0.04', '0.5', '0.12',
+                  '0', 'n', ''])
     assert a.fair_source == 'drift' and a.scenario == 'fade'
     assert a.drift_z == 2.5 and a.min_corr == 0.2 and a.corr_sign == 1
-    assert a.min_edge == 0.04 and a.min_edge_roi == 0.12 and a.vol_spike_guard == 0
+    assert a.min_edge == 0.04 and a.vol_z_min == 0.5
+    assert a.min_edge_roi == 0.12 and a.vol_spike_guard == 0
     assert a.mode == 'off'
 
 
 def test_menu_indicator_defaults_pass_through_as_none():
-    a = run_menu(['1', '', 'y', '', '', '', '', '', '', '', '', 'n', ''])
+    a = run_menu(['1', '', 'y', '', '', '', '', '', '', '', '', '', 'n', ''])
     assert a.min_edge_roi is None and a.vol_spike_guard is None   # None = keep CFG default
+    assert a.vol_z_min is None
     assert a.fair_source is None and a.scenario is None
 
 
@@ -291,3 +294,28 @@ def test_maker_worker_consumes_the_published_input(monkeypatch):
                        poly_fresh=inp['fresh'], now=inp['ts'])
     pdft.MAKER.simulate_paper_fills(inp['ts'])
     assert seen['fair'] == 0.55 and seen['fresh'] is True and seen.get('filled')
+
+
+def test_maker_anchors_on_the_model_even_when_the_blended_fair_is_none(monkeypatch):
+    """2026-07-24 live finding: the maker sat out 70.5% of a session as 'no_fair' even though
+    the strike model probability was computable on 65.9% of ticks. _fair_value() returns None
+    when the drift residual is missing or disagrees with the model — a taker conviction filter
+    that costs a maker its whole reason to exist. The anchor must fall back to the model."""
+    import replay
+    now = 1000000.0
+    an = replay.reset_state()
+    monkeypatch.setattr(pdft, 'MAKER', None)
+    an.fair = None                                  # blended fair unavailable
+    monkeypatch.setattr(an, '_model_p_win', lambda side, t: 0.63)   # but the model IS available
+    an._publish_maker_input({}, {}, now)
+    assert an.maker_input['fair'] == 0.63           # quotes anchor on the model, not on nothing
+
+
+def test_maker_anchor_prefers_model_p_over_the_blended_fair(monkeypatch):
+    """When both exist, use model_p — it is independent of the poly mid (non-circular)."""
+    import replay
+    an = replay.reset_state()
+    monkeypatch.setattr(pdft, 'MAKER', None)
+    an.fair = {'model_p': 0.58, 'fair': 0.42}
+    an._publish_maker_input({}, {}, 1000000.0)
+    assert an.maker_input['fair'] == 0.58
