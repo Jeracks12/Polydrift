@@ -309,3 +309,56 @@ def test_reconcile_runs_on_first_quote_of_a_new_market(monkeypatch):
     monkeypatch.setattr(q, 'reconcile_open_orders', fake_reconcile)
     q.on_tick(fair=0.50, sigma_per_s=1e-9, tau_s=150, z=0.0)   # first tick -> slug change
     assert seen['tokens'] == ['Y', 'N']
+
+
+def test_live_order_is_posted_with_correct_client_call_shape():
+    """LIVE REGRESSION (2026-07-24). create_and_post_order's 2nd POSITIONAL arg is
+    PartialCreateOrderOptions, not the order type. OrderType.GTC is the bare string 'GTC', so
+    passing it positionally made the client evaluate options.tick_size and raise
+        'str' object has no attribute 'tick_size'
+    Every live maker order failed silently for a whole session. Pin the call shape."""
+    import types
+    seen = {}
+
+    class Client:
+        def create_and_post_order(self, order_args, options=None, order_type='GTC',
+                                  post_only=False, defer_exec=False):
+            # mimic the real client: it will touch options.tick_size when options is given
+            if options is not None and not hasattr(options, 'tick_size'):
+                raise AttributeError("'str' object has no attribute 'tick_size'")
+            seen.update(options=options, order_type=order_type, post_only=post_only,
+                        price=order_args.price, size=order_args.size, token=order_args.token_id)
+            return {'success': True, 'orderID': 'ok-1'}
+
+    class Ex:
+        mode = 'live'; killed = False
+        def __init__(self): self.client = Client()
+
+    q, _, _ = mk()
+    q.ex = Ex()
+    oid, _lat = q._post('bid', 0.49, 5.0)
+    assert oid == 'ok-1', 'live post must succeed, not swallow an exception'
+    assert seen['order_type'] == 'GTC'          # passed as a KEYWORD, never positionally
+    assert seen['options'] is None              # the options slot must not hold the order type
+    assert seen['post_only'] is True            # exchange-enforced: rest or reject, never cross
+    assert seen['token'] == 'Y' and seen['price'] == 0.49
+
+
+def test_ask_side_posts_the_no_leg_at_the_complement_price():
+    """A YES ask at 0.56 is economically a NO bid at 0.44, so every order stays a BUY."""
+    seen = {}
+
+    class Client:
+        def create_and_post_order(self, order_args, options=None, order_type='GTC',
+                                  post_only=False, defer_exec=False):
+            seen.update(price=order_args.price, token=order_args.token_id)
+            return {'success': True, 'orderID': 'ok-2'}
+
+    class Ex:
+        mode = 'live'; killed = False
+        def __init__(self): self.client = Client()
+
+    q, _, _ = mk()
+    q.ex = Ex()
+    q._post('ask', 0.56, 5.0)
+    assert seen['token'] == 'N' and seen['price'] == 0.44

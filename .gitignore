@@ -22,6 +22,7 @@ signals*.csv
 paper_trades.csv
 market_state*.csv
 maker_latency*.csv
+maker_fills*.csv
 *.parquet
 
 # ---------------------------------------------------------------------------

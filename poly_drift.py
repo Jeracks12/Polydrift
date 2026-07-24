@@ -1668,6 +1668,10 @@ def main():
                          'signal to get out of the way, not to trade (default 2.5)')
     ap.add_argument('--maker-latency-log', default='maker_latency.csv',
                     help='CSV of every order attempt with its post->ack round trip (ms)')
+    ap.add_argument('--maker-fills-log', default='maker_fills.csv',
+                    help='CSV of every maker FILL with its decision context. This is the input '
+                         'to scripts/markout.py, which measures adverse selection -- the number '
+                         'that decides whether market making here is a business')
     ap.add_argument('--no-state-log', dest='state_log', action='store_false', default=True,
                     help='disable the per-tick market_state.csv research telemetry '
                          '(CFG STATE_LOG; on by default, ~3k rows/hour)')
@@ -1741,7 +1745,8 @@ def main():
                             gamma=args.maker_gamma, kappa=args.maker_kappa,
                             toxic_z=args.maker_toxic_z,
                             inv_skew_ticks=args.maker_inv_skew_ticks,
-                            latency_log=args.maker_latency_log)
+                            latency_log=args.maker_latency_log,
+                            fills_log=args.maker_fills_log)
         L_sess(f"[maker] RESTING QUOTES ON. shares={MAKER.shares:g}/side gamma={args.maker_gamma} "
                f"kappa={args.maker_kappa} toxic_z={args.maker_toxic_z} "
                f"latency->{args.maker_latency_log} | the taker path (_signal) is DISABLED")

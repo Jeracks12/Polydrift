@@ -113,7 +113,7 @@ class MakerQuoter:
     # makes the whole engine inert. (1/gamma)*ln(1+gamma/kappa) = 1 tick needs kappa ~= 100.
     def __init__(self, executor, book, roll, cfg, shares=MIN_SHARES, gamma=3.0, kappa=100.0,
                  toxic_z=2.5, min_edge_c=0.5, max_inventory=2, inv_skew_ticks=1.0,
-                 latency_log='maker_latency.csv'):
+                 latency_log='maker_latency.csv', fills_log='maker_fills.csv'):
         self.ex, self.book, self.roll, self.cfg = executor, book, roll, cfg
         self.shares = max(float(shares), MIN_SHARES)
         self.gamma, self.kappa = float(gamma), float(kappa)
@@ -127,7 +127,11 @@ class MakerQuoter:
         self.last_slug = None
         self.pulled_reason = None
         self.latency_log = latency_log
+        self.fills_log = fills_log
         self._lat_init = False
+        self._fills_init = False
+        # last decision context, stamped onto each fill so markout can be split by regime
+        self._ctx = dict(fair=None, z=None, sigma=None, tau=None)
         self.stats = dict(quotes=0, cancels=0, fills=0, pulls=0, rejects=0)
 
     # ---------- pricing ----------
@@ -205,10 +209,19 @@ class MakerQuoter:
             return f'paper-{side}-{int(t0*1000)}', time.time() - t0
         try:
             from py_clob_client_v2 import OrderArgs, OrderType, Side
+            # KEYWORDS ARE MANDATORY HERE. The signature is
+            #   create_and_post_order(order_args, options, order_type, post_only, ...)
+            # so passing OrderType positionally lands it in `options`, and since OrderType.GTC
+            # is the plain string 'GTC' the client then does options.tick_size and dies with
+            #   'str' object has no attribute 'tick_size'
+            # -- which silently killed EVERY live maker order. options=None lets the client
+            # resolve the market's tick size itself (correct on any market; it caches).
+            # post_only=True makes the EXCHANGE guarantee the order rests or is rejected, so a
+            # maker order can never cross and pay the taker fee even if our price clamp is wrong.
             r = self.ex.client.create_and_post_order(
                 OrderArgs(price=round(px, 2), size=round(size, 2), side=Side.BUY,
                           token_id=token),
-                OrderType.GTC)                       # GTC: it must REST to be a maker order
+                options=None, order_type=OrderType.GTC, post_only=True)
             rd = r if isinstance(r, dict) else {}
             oid = rd.get('orderID') or rd.get('orderId') or rd.get('id')
             err = str(rd.get('errorMsg') or rd.get('error') or '')
@@ -280,6 +293,7 @@ class MakerQuoter:
         """Call once per analytics tick. Idempotent: it only cancels/replaces when the desired
         price actually moved, because churning quotes burns rate limit and queue position."""
         now = now or time.time()
+        self._ctx = dict(fair=fair, z=z, sigma=sigma_per_s, tau=tau_s)
         slug = self.roll.get('slug')
         if slug != self.last_slug:              # the market rolled under us (or first tick)
             self.cancel_all('market rolled')
@@ -409,9 +423,17 @@ class MakerQuoter:
         stays as a per-cycle quoting aid; the money is owned by the Executor."""
         self.stats['fills'] += 1
         self.inventory += size if side == 'bid' else -size
+        # mid AT THE MOMENT OF THE FILL is the markout baseline: (mid0 - price) is the spread we
+        # captured, and everything the mid does afterwards is adverse selection (or luck).
+        bb = _safe_extreme(self.book.bids, max)
+        ba = _safe_extreme(self.book.asks, min)
+        mid0 = (bb + ba) / 2.0 if (bb and ba) else None
         rec = dict(ts=now, slug=self.roll.get('slug'), side=side, price=price, size=size,
-                   inventory=self.inventory, fee=fee)
+                   inventory=self.inventory, fee=fee, mid0=mid0,
+                   fair=self._ctx.get('fair'), z=self._ctx.get('z'),
+                   tau=self._ctx.get('tau'))
         self.fills.append(rec)
+        self._log_fill(rec)
         if self.ex is not None and getattr(self.ex, 'register_maker_fill', None):
             # bid fill -> hold YES (BUY, YES token); ask fill -> hold NO (SELL, NO token)
             exec_side = 'BUY' if side == 'bid' else 'SELL'
@@ -422,6 +444,26 @@ class MakerQuoter:
               f'-> inventory {self.inventory:+.2f} YES-equivalent')
 
     # ---------- telemetry ----------
+    def _log_fill(self, rec):
+        """One row per FILL. This is the input to scripts/markout.py — the only way to answer
+        the question that decides whether market making here is a business: after someone hits
+        our quote, which way does the market go? Fills that are systematically followed by
+        adverse moves mean we are being picked off faster than the toxicity gate can pull."""
+        try:
+            if not self._fills_init:
+                with open(self.fills_log, 'a') as f:
+                    if f.tell() == 0:
+                        f.write('ts,slug,side,price,size,fee,mid0,fair,z,tau,inventory,mode\n')
+                self._fills_init = True
+            n = lambda v: '' if v is None else f'{v:.6g}'
+            with open(self.fills_log, 'a') as f:
+                f.write(f"{rec['ts']},{rec['slug'] or ''},{rec['side']},{rec['price']:.4f},"
+                        f"{rec['size']:.4f},{rec['fee']:.6f},{n(rec['mid0'])},{n(rec['fair'])},"
+                        f"{n(rec['z'])},{n(rec['tau'])},{rec['inventory']:.4f},"
+                        f"{getattr(self.ex, 'mode', 'off')}\n")
+        except Exception:
+            pass          # telemetry must never break trading
+
     def _log_latency(self, now, side, px, latency_s, oid):
         """One row per order attempt. This is the file to read after a live run: it is the
         only place the REAL post->ack round trip is recorded."""

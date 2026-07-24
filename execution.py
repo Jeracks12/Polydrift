@@ -376,10 +376,13 @@ class Executor:
                     order_type=OrderType.FOK)
             else:
                 shares = max(self.stake / max(bbo_px, 0.01), self.min_shares)
+                # order_type MUST be keyword: the 2nd positional is PartialCreateOrderOptions,
+                # and OrderType.FAK is the bare string 'FAK', so passing it positionally raises
+                # "'str' object has no attribute 'tick_size'" and no order is ever placed.
                 r = self.client.create_and_post_order(
                     OrderArgs(price=round(bbo_px, 2), size=round(shares, 2),
                               side=Side.BUY, token_id=token),
-                    OrderType.FAK)                          # no resting risk
+                    options=None, order_type=OrderType.FAK)     # no resting risk
             rd = r if isinstance(r, dict) else {}
             oid = rd.get('orderID') or rd.get('orderId') or rd.get('id')
             err = str(rd.get('errorMsg') or rd.get('error') or '')
