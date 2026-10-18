@@ -169,3 +169,71 @@ def drift_z(res):
 def fair_from_mid(mid, dev):
     """Fair poly price if it closes the abnormal gap: shift mid by -dev in logit space."""
     return float(expit(logit(np.array([mid]))[0] - dev))
+
+
+def taker_fee(p, rate=0.07, exponent=1):
+    """Polymarket taker fee PER SHARE, in price units, under `crypto_fees_v2`.
+
+        fee = rate * (p * (1 - p)) ** exponent
+
+    Verified against the live market config on the 5-minute up/down markets
+    (gamma-api `feeSchedule`): {'exponent': 1, 'rate': 0.07, 'takerOnly': True,
+    'rebateRate': 0.2}, and against the documented worked examples -- 100 shares at
+    $0.50 costs $1.75, at $0.30 or $0.70 costs $1.47.
+
+    `p` is the price of the LEG BEING TRADED, so it is symmetric between YES and NO
+    (fee(p) == fee(1-p)) and no side is structurally cheaper. MAKERS PAY NOTHING
+    (`takerOnly: True`), which is the whole reason a resting quote is worth building.
+
+    In cents the fee peaks at p=0.5 (1.75c), but as a FRACTION OF CAPITAL it is
+    rate*(1-p) -- worst at the cheap end (6.3% of capital at p=0.10, 0.7% at p=0.90).
+    Any gate that reasons in EV-per-dollar is therefore biased toward exactly the
+    entries this fee punishes hardest."""
+    p = min(max(float(p), 0.0), 1.0)
+    return float(rate * (p * (1.0 - p)) ** exponent)
+
+
+# --- EMPIRICAL binary calibration -------------------------------------------------------
+# P(up | x) measured on 419,444 rows / 104,861 real BTC 5-minute cycles, where
+#     x = ln(S/K) / (sigma*sqrt(tau))
+# is exactly the argument binary_p_up() feeds to Phi(). Fitted on 2025-07-18..2026-02-21 and
+# scored on 2026-02-22..2026-07-17 (walk-forward, no lookahead), isotonic so P(up) cannot
+# decrease in moneyness. Rebuild with `python scripts/fit_calibration.py --emit`.
+#
+# WHY: the Gaussian is not overconfident here, it is UNDER-confident in the body. Measured
+# out-of-sample error of Phi() reaches 8-9 POINTS (at x~-0.7 it says 0.235 where the truth is
+# 0.159; at x~+0.7 it says 0.760 where the truth is 0.839) -- roughly 3x the entire MIN_EDGE
+# threshold the strategy trades on. CALIB_SLOPE=0.9 compresses toward 0.5 and therefore makes
+# it WORSE (Brier 0.13271 vs 0.13063 raw); the sweep is monotone up to ~1.5.
+#   Brier, out of sample:  raw Phi 0.13063 | slope 0.9 0.13271 | best slope 1.5 0.12688
+#                          EMPIRICAL 0.12655
+_EMP_X = [-2.925, -2.775, -2.625, -2.475, -2.325, -2.175, -2.025, -1.875, -1.725, -1.575,
+          -1.425, -1.275, -1.125, -0.975, -0.825, -0.675, -0.525, -0.375, -0.225, -0.075,
+          0.075, 0.225, 0.375, 0.525, 0.675, 0.825, 0.975, 1.125, 1.275, 1.425,
+          1.575, 1.725, 1.875, 2.025, 2.175, 2.325, 2.475, 2.625, 2.775, 2.925]
+_EMP_P = [0.00041, 0.00079, 0.00079, 0.00243, 0.00528, 0.0064, 0.00769, 0.01007, 0.01008,
+          0.0151, 0.02544, 0.03631, 0.04839, 0.06569, 0.10707, 0.13659, 0.18495, 0.24153,
+          0.30527, 0.38764, 0.63621, 0.69034, 0.75632, 0.813, 0.86138, 0.89466, 0.9295,
+          0.95151, 0.96729, 0.97392, 0.98281, 0.98952, 0.99412, 0.99412, 0.99584, 0.99629,
+          0.9974, 0.99921, 0.99921, 0.99972]
+
+
+def standardized_moneyness(S, K, sigma_per_s, tau_s):
+    """x = ln(S/K)/(sigma*sqrt(tau)) — the sufficient statistic both pricers consume.
+    None when it is not computable (dead vol, expired, bad price)."""
+    if not (S and K) or S <= 0 or K <= 0:
+        return None
+    denom = sigma_per_s * math.sqrt(max(tau_s, 1e-9))
+    if denom <= 0:
+        return None
+    return math.log(S / K) / denom
+
+
+def empirical_p_up(S, K, sigma_per_s, tau_s):
+    """P(up) from the measured conditional frequency instead of Phi(). Linear between knots,
+    flat outside the fitted range (|x|>2.925 is already 0.9997/0.0004 — clamping there is the
+    conservative choice, since extrapolating a fitted tail is how you manufacture edge)."""
+    x = standardized_moneyness(S, K, sigma_per_s, tau_s)
+    if x is None:
+        return 0.5
+    return float(np.clip(np.interp(x, _EMP_X, _EMP_P), 1e-6, 1 - 1e-6))

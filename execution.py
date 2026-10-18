@@ -376,10 +376,13 @@ class Executor:
                     order_type=OrderType.FOK)
             else:
                 shares = max(self.stake / max(bbo_px, 0.01), self.min_shares)
+                # order_type MUST be keyword: the 2nd positional is PartialCreateOrderOptions,
+                # and OrderType.FAK is the bare string 'FAK', so passing it positionally raises
+                # "'str' object has no attribute 'tick_size'" and no order is ever placed.
                 r = self.client.create_and_post_order(
                     OrderArgs(price=round(bbo_px, 2), size=round(shares, 2),
                               side=Side.BUY, token_id=token),
-                    OrderType.FAK)                          # no resting risk
+                    options=None, order_type=OrderType.FAK)     # no resting risk
             rd = r if isinstance(r, dict) else {}
             oid = rd.get('orderID') or rd.get('orderId') or rd.get('id')
             err = str(rd.get('errorMsg') or rd.get('error') or '')
@@ -407,6 +410,55 @@ class Executor:
         except Exception as e:
             _xlog(f'[exec] live order FAILED: {e}')
             return 0.0, 0.0
+
+    # ---------- maker fills ----------
+    def register_maker_fill(self, slug, side, shares, price, token, ts, fee=0.0):
+        """Book a RESTING-quote fill as a position so it settles through the same
+        on_roll/verify_settlement path as a taker entry, counts against the daily-loss cap, and
+        can trip the kill switch. There is NO entry gate here: the fill already happened on the
+        book, so refusing it would only desync our record from reality.
+
+        `price` is the YES-space quote price. A bid fill = we hold YES at `price` (side BUY); an
+        ask fill = we hold NO at `1-price` (side SELL), exactly the executor's existing leg
+        convention. A matched YES+NO pair therefore settles to spread capture automatically:
+        buy YES @0.49 and NO @0.49 costs 0.98, pays 1 -> +0.02, no special case needed."""
+        self._roll_day()
+        leg_px = price if side == 'BUY' else (1.0 - price)
+        cost = shares * leg_px + fee                    # fee is 0 for a true maker fill
+        for p in self.positions:                       # merge into today's same-side maker leg
+            if p['slug'] == slug and p['side'] == side and p.get('strat') == 'maker':
+                p['shares'] += shares; p['cost'] += cost
+                p['entry'] = p['cost'] / p['shares'] if p['shares'] else leg_px
+                break
+        else:
+            self.positions.append(dict(slug=slug, side=side, shares=shares, entry=leg_px,
+                                       cost=cost, ts=ts, token=token, strat='maker'))
+        # PREMISE CHECK. The entire maker case is "makers pay no fee" (feeSchedule takerOnly).
+        # If a real fill ever reports a fee, that premise is FALSE and the strategy economics
+        # flip -- so surface it loudly and keep a running total, never swallow it. daily_pnl
+        # already carries the fee via `cost`, so the kill switch sees it too.
+        self.maker_fees_paid = getattr(self, 'maker_fees_paid', 0.0) + fee
+        if fee > 1e-9:
+            _xlog(f'[exec] !!! MAKER FEE CHARGED: ${fee:.4f} on {side} {shares:.2f}sh {slug} — '
+                  f'the "makers pay zero" premise is VIOLATED. Total maker fees today '
+                  f'${self.maker_fees_paid:.4f}. Re-run scripts/check_fees.py and STOP if this '
+                  f'persists.')
+        # The kill switch normally fires inside on_signal, which maker mode never calls. Trip it
+        # here too: realized daily losses (from settled prior cycles) must stop new quoting, and
+        # `killed` is what MakerQuoter.toxicity reads to pull every quote.
+        if self.daily_pnl <= -self.max_daily_loss and not self.killed:
+            self.killed = True
+            _xlog(f'[exec] KILL SWITCH (maker): daily pnl {self.daily_pnl:+.2f} '
+                  f'<= -{self.max_daily_loss}. Quotes will be pulled.')
+        _xlog(f'[exec] maker leg booked: {side} {shares:.2f} sh @ {leg_px:.3f} (${cost:.2f}) '
+              f'{slug} | open maker legs '
+              f'{sum(1 for p in self.positions if p.get("strat") == "maker")}')
+
+    def maker_exposure(self):
+        """USDC currently at risk in open maker legs — the number a maker-side risk check
+        reasons about (gross cost; a hedged YES+NO pair overstates risk, which is the safe
+        direction for a cap)."""
+        return sum(p['cost'] for p in self.positions if p.get('strat') == 'maker')
 
     # ---------- cycle end ----------
     def on_roll(self, ended_slug, final_mid):

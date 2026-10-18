@@ -1,5 +1,6 @@
 # tests/test_execution.py — paper executor: fills, caps, settlement, kill switch.
 import os, sys, tempfile
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from execution import Executor
@@ -355,3 +356,120 @@ def test_failed_exit_backs_off_instead_of_retrying_every_tick(monkeypatch):
     ok2, msg2 = ex.exit_position(pos, 'tp')                       # immediate retry
     assert not ok2 and 'backoff' in msg2
     assert pos in ex.positions                                    # never dropped
+
+
+# ---- exit/entry marks must price the REAL book, never top-of-book ----
+# Measured over 13,016 live ticks: resting top-of-book bid depth is 2 sh at p1, 5 at p5, 8 at
+# p10. A scalp holding more than that could never sell at `bb`, so a TP marked at `bb` fires on
+# size that does not exist and books a profit the exit cannot realise.
+import poly_drift as pdft
+
+
+class _FakeExec:
+    stake = 1.0
+    def __init__(self, positions): self.positions = positions; self.exited = []
+    def exit_position(self, pos, reason):
+        self.exited.append((pos, reason)); self.positions.remove(pos)
+        return True, f'exit {reason}'
+
+
+def _exit_env(monkeypatch, bids, asks, pos):
+    monkeypatch.setitem(pdft.CFG, 'EXIT_ENABLE', 1)
+    monkeypatch.setitem(pdft.CFG, 'EXIT_TP_C', 2.0)
+    monkeypatch.setitem(pdft.CFG, 'EXIT_THESIS', 0)
+    monkeypatch.setitem(pdft.CFG, 'EXIT_MIN_HOLD_S', 3)
+    pdft.POLY_BOOK.bids = dict(bids); pdft.POLY_BOOK.asks = dict(asks)
+    ex = _FakeExec([pos])
+    monkeypatch.setattr(pdft, 'EXECUTOR', ex)
+    return pdft.Analytics(siglog=None), ex
+
+
+def test_take_profit_is_not_taken_on_depth_that_is_not_there(monkeypatch):
+    """1 sh at 0.40 over a wall at 0.30: top-of-book says +10c/sh, the book pays +1c on 10 sh."""
+    now = 1000.0
+    pos = dict(slug='m1', side='BUY', shares=10.0, entry=0.30, cost=3.0, ts=now - 60)
+    an, ex = _exit_env(monkeypatch, {0.40: 1, 0.30: 500}, {0.42: 500}, pos)
+    assert abs(pdft.Analytics._sell_vwap('BUY', 10.0)[0] - 0.31) < 1e-12   # (0.40+9*0.30)/10
+    an._manage_exits(now)
+    assert ex.exited == []                                       # +1.0c/sh < the 2c take-profit
+
+
+def test_take_profit_still_fires_when_the_depth_is_real(monkeypatch):
+    now = 1000.0
+    pos = dict(slug='m1', side='BUY', shares=10.0, entry=0.30, cost=3.0, ts=now - 60)
+    an, ex = _exit_env(monkeypatch, {0.40: 100}, {0.42: 500}, pos)
+    an._manage_exits(now)
+    assert ex.exited and ex.exited[0][1] == 'tp'
+    assert pos.get('sig') is None                                # no sig attached: nothing to rescore
+
+
+def test_sell_side_marks_no_against_the_asks_not_the_top_ask(monkeypatch):
+    """A SELL holds NO; it sells NO into the YES asks ascending (NO bid = 1 - ask)."""
+    now = 1000.0
+    pos = dict(slug='m1', side='SELL', shares=10.0, entry=0.30, cost=3.0, ts=now - 60)
+    an, ex = _exit_env(monkeypatch, {0.28: 500}, {0.60: 1, 0.70: 500}, pos)
+    assert abs(pdft.Analytics._sell_vwap('SELL', 10.0)[0] - 0.31) < 1e-12  # (0.40+9*0.30)/10
+    an._manage_exits(now)
+    assert ex.exited == []
+    pdft.POLY_BOOK.asks = {0.60: 100}                            # real depth -> +10c/sh
+    an._manage_exits(now)
+    assert ex.exited and ex.exited[0][1] == 'tp'
+
+
+def test_dust_book_yields_no_exit_rather_than_a_phantom_one(monkeypatch):
+    now = 1000.0
+    pos = dict(slug='m1', side='BUY', shares=10.0, entry=0.30, cost=3.0, ts=now - 60)
+    an, ex = _exit_env(monkeypatch, {0.90: 0.001}, {0.95: 500}, pos)
+    an._manage_exits(now)
+    assert ex.exited == []            # 0.001 sh is below the 0.01 CLOB step: no exit exists
+
+
+def test_paid_effective_does_not_fall_back_to_optimistic_top_of_book(monkeypatch):
+    """Book holds $0.90 against a $1 stake. The old fallback quoted 0.40 -- the best price in
+    the worst book. The honest mark is the VWAP of what is actually there."""
+    monkeypatch.setattr(pdft, 'EXECUTOR', None)
+    pdft.POLY_BOOK.bids = {0.30: 500}; pdft.POLY_BOOK.asks = {0.40: 1, 0.50: 1}
+    an = pdft.Analytics(siglog=None)
+    assert pdft.Analytics._walk_price(False, 1.0) is None            # gate contract preserved
+    assert abs(an._paid_effective('BUY', 0.30, 0.40) - 0.45) < 1e-12  # (0.40+0.50)/2 shares
+    assert not pdft.Analytics._book_absorbs('BUY', 1.0)
+    assert pdft.Analytics._book_absorbs('BUY', 0.5)
+
+
+# ---- maker settlement (audit M1): maker fills must settle through the executor ----
+def test_maker_fill_books_a_settleable_position_and_pnl():
+    """A maker bid fill = holding YES; it must settle at on_roll like any position and its P&L
+    must reach daily_pnl (so the kill switch can see it). Before this the fill only moved a
+    local counter that was zeroed at the next roll — real money in, no P&L, no risk."""
+    ex, book, roll = make_exec()
+    ex.register_maker_fill('m1', 'BUY', 5.0, 0.40, 'Y', ts=1000.0)   # 5 YES @0.40, cost $2.00
+    assert len(ex.positions) == 1 and ex.positions[0]['strat'] == 'maker'
+    assert ex.positions[0]['cost'] == 2.0
+    ex.on_roll('m1', final_mid=0.99)                                 # YES won
+    assert ex.daily_pnl == pytest.approx(5.0 - 2.0)                  # payout 5 - cost 2 = +3
+
+
+def test_maker_matched_pair_nets_to_spread_capture():
+    """Buy YES @0.49 and NO @0.49 (an ask quoted at 0.51) costs 0.98/share and pays exactly 1
+    whichever way it resolves — the market-maker's spread. The two legs must net to +0.02/sh."""
+    ex, book, roll = make_exec()
+    ex.register_maker_fill('m1', 'BUY', 5.0, 0.49, 'Y', ts=1.0)      # 5 YES @0.49
+    ex.register_maker_fill('m1', 'SELL', 5.0, 0.51, 'N', ts=2.0)    # ask@0.51 -> 5 NO @0.49
+    assert ex.maker_exposure() == pytest.approx(5 * 0.49 + 5 * 0.49)
+    for final in (0.99, 0.01):                                       # resolves either way
+        e2, _, _ = make_exec()
+        e2.register_maker_fill('m1', 'BUY', 5.0, 0.49, 'Y', ts=1.0)
+        e2.register_maker_fill('m1', 'SELL', 5.0, 0.51, 'N', ts=2.0)
+        e2.on_roll('m1', final_mid=final)
+        assert e2.daily_pnl == pytest.approx(5 * 0.02)               # +0.02/sh, both outcomes
+
+
+def test_maker_fill_trips_the_daily_loss_kill_switch():
+    """The kill switch normally fires inside on_signal, which maker mode never calls. A realized
+    maker loss must still trip it, or --max-daily-loss is meaningless in maker mode."""
+    ex, book, roll = make_exec(max_daily_loss=1.0)
+    ex.register_maker_fill('m1', 'BUY', 5.0, 0.40, 'Y', ts=1.0)     # $2 at risk
+    ex.on_roll('m1', final_mid=0.01)                                # YES lost -> -$2 realized
+    assert ex.daily_pnl == pytest.approx(-2.0)
+    ex.register_maker_fill('m2', 'BUY', 5.0, 0.40, 'Y', ts=2.0)     # next fill checks the cap
+    assert ex.killed is True                                        # -2 <= -1 -> pulled

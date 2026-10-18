@@ -15,7 +15,8 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from drift_math import (grid_series, grid_vol, composite_px, logit, expit, rets,
                         xcorr_best, beta_residual, robust_z, binary_p_up,
-                        realized_sigma_per_s, calibrate_prob, drift_z, fair_from_mid)
+                        realized_sigma_per_s, calibrate_prob, drift_z, fair_from_mid,
+                        taker_fee, empirical_p_up)
 from recorder import Recorder
 try:
     from logbook import (init_logs, err as L_err, warn as L_warn,
@@ -110,9 +111,23 @@ CFG = dict(
     # --- round-trip-cost gate: require the model edge to also clear the LIVE cost of trading
     #     (the current bid-ask spread, which adapts to the book) instead of only the fixed
     #     MIN_EDGE floor. Required edge = max(MIN_EDGE, RT_SPREAD_MULT*spread + fee + buffer). ---
-    RT_GATE=0,           # 1 = on (protective); 0 = off (fixed MIN_EDGE only)
+    RT_GATE=1,           # 1 = on (protective); 0 = off (fixed MIN_EDGE only)
+                         # DEFAULT CHANGED TO 1 (2026-07-23). With FEE_RATE_TAKER now modelling
+                         # the real crypto_fees_v2 schedule, leaving this off means every gate
+                         # is calibrated against a trading cost of ZERO that is really ~2.6c/
+                         # share round trip -- larger than the whole measured gross edge.
     RT_SPREAD_MULT=1.0,  # how many round-trip spreads the edge must clear (1.0 = one full spread)
-    RT_FEE_C=0.0,        # Polymarket per-share round-trip fee, cents (measure from fills; 0 default)
+    # --- TAKER FEE. Polymarket ships `crypto_fees_v2` on the 5-minute up/down markets and it
+    #     is the single largest cost in this strategy. Read live off gamma-api `feeSchedule`:
+    #         {'exponent': 1, 'rate': 0.07, 'takerOnly': True, 'rebateRate': 0.2}
+    #     fee/share = rate * (p*(1-p))**exponent, charged to TAKERS ONLY. Verify against the
+    #     live market with scripts/check_fees.py before trusting these numbers with size --
+    #     Polymarket has changed this schedule once already and will again. ---
+    FEE_RATE_TAKER=0.07, # 0 = model the market as fee-free (WRONG for crypto markets)
+    FEE_EXPONENT=1,      # power applied to p*(1-p); 1 = the documented schedule
+    RT_FEE_C=0.0,        # EXTRA per-share round-trip cost in cents ON TOP of the fee schedule
+                         # (measured slippage, gas, whatever). Was the whole fee model; now an
+                         # additive fudge that should normally stay 0.
     RT_BUFFER_C=0.5,     # extra safety margin, cents, on top of spread+fee
     # --- active exit management (OFF by default; a drift entry is a TIMING scalp, so exit
     #     when the mispricing closes rather than riding it to resolution) ---
@@ -182,8 +197,17 @@ CFG = dict(
                          # model estimate; at a huge edge (e.g. spot clearly above the strike
                          # while poly still prices UP cheap) waiting for lead/lag just forfeits
                          # it. Safety gates (freshness, feasibility, cutoff, edge) still apply.
-    CALIB_SLOPE=0.9,     # logit-space recalibration of the binary model (year backtest slope
-                         # ~0.9): <1 de-biases the overconfident Gaussian tails. 1.0 = raw.
+    # --- BINARY PRICER CALIBRATION. 'empirical' replaces Phi() with the MEASURED conditional
+    #     frequency P(up | ln(S/K)/(sigma*sqrt(tau))) from 419,444 rows / 104,861 real cycles
+    #     (walk-forward fit; see scripts/fit_calibration.py and drift_math._EMP_P).
+    #     Out-of-sample Brier: raw Phi 0.13063 | CALIB_SLOPE 0.9 0.13271 | EMPIRICAL 0.12655.
+    #     At +-10bp from the strike -- where these markets actually trade -- the two disagree
+    #     by up to 11 POINTS, i.e. 11c/share against a 3c MIN_EDGE and a 1.75c fee. ---
+    CALIB_MODE='empirical',  # 'empirical' (measured table) | 'logit' (Phi + CALIB_SLOPE)
+    CALIB_SLOPE=1.5,     # only used when CALIB_MODE='logit'. WAS 0.9, which was BACKWARDS:
+                         # the Gaussian is UNDER-confident in the body, not overconfident, so
+                         # a slope <1 compresses toward 0.5 and makes it worse. The sweep is
+                         # monotone improving to ~1.5. 1.0 = raw Phi.
 )
 PRESET_5M = dict(WINDOW_S=300, XCORR_WIN_S=90, MAX_LAG_S=15, DRIFT_H_S=5, SIG_COOLDOWN_S=10,
                  EVAL_H_S=30, CORR_SIGN=1)  # Up-leg must co-move positively with the ref
@@ -256,6 +280,7 @@ POLY_BOOK = PolyBook()
 ROLL = dict(token=None, token_no=None, slug=None, end=None, open=None,
             strike=None, strike_ref=None)
 EXECUTOR = None  # execution.Executor when --mode paper|live; None = signals only
+MAKER = None     # maker.MakerQuoter when --maker; None = the taker path (_signal)
 ROLLS = deque(maxlen=100)  # roll timestamps (mask poly returns across market boundary)
 
 # ---------------- feeds ----------------
@@ -462,6 +487,7 @@ class Analytics:
     def __init__(self, siglog=None):
         self.snap = {}; self.signals = deque(maxlen=500)
         self.fair = None                  # latest exchange-implied fair value (set per tick)
+        self.maker_input = None           # atomic handoff to the maker thread (None until set)
         self.last_sig = {'BUY': 0.0, 'SELL': 0.0}   # per-side cooldown
         self.last_gate = 'init'      # which gate blocked (or fired) on the latest tick
         self.pending = deque()                       # signals awaiting outcome eval
@@ -552,8 +578,59 @@ class Analytics:
         self.fair = self._fair_value(stats, now)   # once per tick: exits and entries agree
         self._eval_pending(now)
         self._manage_exits(now)          # close open positions before adding new ones
-        self._signal(stats, drift, now)
+        if MAKER is not None:
+            self._publish_maker_input(stats, drift, now)   # RESTING quotes instead of crossing
+        else:
+            self._signal(stats, drift, now)
         self._write_state(now, stats, drift)
+
+    def _publish_maker_input(self, stats, drift, now):
+        """Compute the maker's decision inputs on THIS (analytics) thread and hand them to the
+        maker thread as one atomic dict. All the numpy stays here; the maker thread does only
+        HTTP. The handoff is a single rebind (like AN.snap), so the maker never reads a
+        half-updated state.
+
+        MAKER and _signal are mutually exclusive: quoting both sides while also crossing the
+        spread would trade against our own resting orders and pay the taker fee maker mode
+        exists to avoid.
+
+        Fair ANCHOR is the strike model probability, NOT the blended drift fair (audit M6). The
+        drift fair is `fair_from_mid(mid, dev)` -- anchored to the current poly mid, so quoting
+        around it is partly circular. model_p depends only on S/K/sigma/tau and is the
+        independent estimate a maker should quote around; fall back to the blended fair only
+        when there is no trusted strike."""
+        ref, st = self._best_ref(stats)
+        z = drift.get(ref) if ref else None
+        tau = None if ROLL['end'] is None else ROLL['end'] - now
+        sigma = None
+        px = self.snap.get('px', {})
+        if ROLL['strike_ref'] in px:
+            sigma = realized_sigma_per_s(px[ROLL['strike_ref']], CFG['VOL_LOOKBACK_S'])
+            if CFG['VOL_SPIKE_GUARD'] and sigma is not None:   # audit M7: same guard as the taker
+                fast = realized_sigma_per_s(px[ROLL['strike_ref']], CFG['VOL_FAST_S'])
+                if fast is not None:
+                    sigma = max(sigma, fast)
+        q = FEEDS['poly'].quotes
+        fresh = bool(q) and (now - q[-1][0]) <= CFG['POLY_STALE_S']
+        # ANCHOR. Prefer the strike model probability: it depends only on S/K/sigma/tau, never on
+        # the poly mid, so quoting around it is not circular (audit M6).
+        #
+        # Critically, do NOT require self.fair. _fair_value() returns None whenever the drift
+        # residual is unavailable (no leading ref) or DISAGREES with the model -- an agreement
+        # filter that earns its keep for a taker taking conviction bets, but for a maker it is
+        # pure lost quoting time. Measured on 2026-07-24 (5,085 ticks / 22 cycles): the model
+        # probability was computable on 65.9% of ticks but self.fair existed on only 29.4%, so
+        # the maker sat out 1,873 ticks it could have quoted -- 70.5% of the session was
+        # 'no_fair'. Fall back to the model directly, exactly as _write_state already does.
+        fv = self.fair
+        anchor = fv.get('model_p') if fv else None
+        if anchor is None:
+            anchor = self._model_p_win('BUY', now)    # trusted strike is all this needs
+        if anchor is None and fv:
+            anchor = fv.get('fair')                   # last resort: the blended drift fair
+        self.maker_input = dict(fair=anchor, sigma=(sigma or 0.0), tau=tau, z=z,
+                                fresh=fresh, slug=ROLL['slug'], ts=now)
+        self.last_gate = 'MAKER_' + ((MAKER.pulled_reason if MAKER else None) or 'quoting')
 
     def _tradable(self, now):
         """Shared pre-trade guard for BOTH strategies. Returns True only if it is safe to
@@ -686,6 +763,14 @@ class Analytics:
             L_sig(f"[skip] DRIFT {why} (fair {fair:.3f} mid {mid:.3f} {scen} "
                   f"spread {ba - bb:.3f})")
             return
+        # the edge must be executable IN SIZE. _paid_effective now prices a short book at the
+        # partial VWAP, which keeps the number honest but still lets an unfillable quote score
+        # as an entry; this is the gate that declines it, and it names itself in the state CSV.
+        stake_req = getattr(EXECUTOR, 'stake', None) or CFG['RESEARCH_STAKE']
+        if not self._book_absorbs(side, stake_req):
+            self.last_gate = 'thin_book'
+            L_sig(f"[skip] DRIFT {side}: book cannot absorb ${stake_req:.2f} at {exec_px:.3f} "
+                  f"(edge {edge:+.3f} is not executable in size)"); return
         if now - self.last_sig[side] < CFG['SIG_COOLDOWN_S']: self.last_gate = 'cooldown'; return
         # CONVICTION OVERRIDE: a large enough edge trades on the dislocation alone.
         conviction = CFG['EDGE_OVERRIDE'] > 0 and edge >= CFG['EDGE_OVERRIDE']
@@ -840,8 +925,11 @@ class Analytics:
                 sigma = max(sigma, fast)
         if tau <= 0 or sigma is None:
             return None
-        p_up = calibrate_prob(binary_p_up(float(px[ref][-1]), ROLL['strike'], sigma, tau),
-                              CFG['CALIB_SLOPE'])
+        S = float(px[ref][-1])
+        if CFG['CALIB_MODE'] == 'empirical':
+            p_up = empirical_p_up(S, ROLL['strike'], sigma, tau)
+        else:
+            p_up = calibrate_prob(binary_p_up(S, ROLL['strike'], sigma, tau), CFG['CALIB_SLOPE'])
         return p_up if side == 'BUY' else 1 - p_up   # BUY bets Up, SELL bets Down
 
     @staticmethod
@@ -851,11 +939,15 @@ class Analytics:
         return ba if side == 'BUY' else 1.0 - bb
 
     @staticmethod
-    def _walk_price(no_side, stake):
+    def _walk_price(no_side, stake, partial=False):
         """VWAP price actually paid to spend `stake` walking the LIVE book (mirrors the
         executor's market-order fill). None if the book can't fill the whole stake.
         Top-of-book is a lie for anything bigger than the top level: a live BUY quoted at
-        0.43 filled at 0.52 because $1 swept several levels."""
+        0.43 filled at 0.52 because $1 swept several levels.
+
+        `partial=True` returns the VWAP of what the book CAN absorb instead of None. That
+        price is never better than top-of-book (levels are walked worst-ward), so it is the
+        conservative mark to gate on; the None contract is what the thin-book GATE tests."""
         levels = POLY_BOOK.bids if no_side else POLY_BOOK.asks
         spend = shares = 0.0
         for p in sorted(levels, reverse=no_side):
@@ -864,16 +956,47 @@ class Analytics:
             take = min(stake - spend, levels[p] * cost_px)
             if take <= 1e-9: break
             shares += take / cost_px; spend += take
-        if shares <= 0 or spend < stake * 0.999:
+        if shares <= 0 or (spend < stake * 0.999 and not partial):
             return None                        # book can't absorb the stake
         return spend / shares
 
+    @staticmethod
+    def _sell_vwap(side, shares):
+        """Proceeds PER SHARE for selling `shares` of an open position into the LIVE book, and
+        how many shares the book can actually take. Mirrors Executor.exit_position: a BUY holds
+        YES and sells into the bids (descending); a SELL holds NO and sells it into the asks
+        (ascending), where the NO bid behind a YES ask `a` is 1-a.
+
+        Top-of-book is the wrong mark here for the same reason it is wrong on entry, and it is
+        wrong in the direction that MANUFACTURES take-profits: measured over 13,016 live ticks
+        the resting top-of-book bid is 2 shares at p1, 5 at p5, 8 at p10 -- routinely less than
+        a scalp holds. Returns (None, 0.0) when nothing can be sold."""
+        levels = POLY_BOOK.bids if side == 'BUY' else POLY_BOOK.asks
+        got = sold = 0.0
+        for p in sorted(levels, reverse=(side == 'BUY')):
+            px = p if side == 'BUY' else 1.0 - p
+            if px <= 0 or levels[p] <= 0: continue
+            take = min(shares - sold, levels[p])
+            if take <= 1e-9: break
+            got += take * px; sold += take
+        return ((got / sold) if sold > 0 else None), sold
+
+    @staticmethod
+    def _book_absorbs(side, stake):
+        """Can the live book fill `stake` dollars on this side at all? A book too thin to fill
+        the entry is the same book that will refuse the exit, so an unfillable quote is not a
+        tradable edge -- it is a quote."""
+        return stake <= 0 or Analytics._walk_price(side == 'SELL', stake) is not None
+
     def _paid_effective(self, side, bb, ba):
-        """Price per share we EXPECT to pay for the configured stake. Falls back to
-        top-of-book when the book is unreadable or we're not sizing a real order."""
+        """Price per share we EXPECT to pay for the configured stake, walked against the REAL
+        book. When the book cannot absorb the whole stake we take the VWAP of the part it can
+        (>= top-of-book, i.e. conservative) rather than the old top-of-book fallback, which
+        quoted the most optimistic price in exactly the book where the fill is worst.
+        Top-of-book survives only as the last resort on an unreadable/empty book."""
         stake = getattr(EXECUTOR, 'stake', None) or CFG['RESEARCH_STAKE']
         if stake > 0:
-            eff = self._walk_price(side == 'SELL', stake)
+            eff = self._walk_price(side == 'SELL', stake, partial=True)
             if eff is not None:
                 return eff
         return self.paid_price(side, bb, ba)
@@ -885,7 +1008,7 @@ class Analytics:
         justifying an 88c share, where 3c is a 3.4% return against a 100% downside."""
         req = CFG['MIN_EDGE']
         if CFG['RT_GATE']:
-            rtc = self._round_trip_cost(bb, ba)
+            rtc = self._round_trip_cost(bb, ba, pay)
             if rtc is not None: req = max(req, rtc)
         if CFG['MIN_EDGE_ROI'] > 0 and pay > 0:
             req = max(req, CFG['MIN_EDGE_ROI'] * pay)
@@ -902,13 +1025,24 @@ class Analytics:
         return p - self._paid_effective(side, bb, ba)
 
     @staticmethod
-    def _round_trip_cost(bb, ba):
+    def _round_trip_cost(bb, ba, pay=None):
         """Live cost (in price units) to round-trip a trade at the current book: cross the
-        bid-ask spread + fee + buffer. This is 'the stretch the edge must cover'. None on a
-        crossed/empty book."""
+        bid-ask spread + the REAL taker fee + buffer. 'The stretch the edge must cover'.
+        None on a crossed/empty book.
+
+        The fee is charged per LEG TRADED and depends on that leg's price, so it needs `pay`.
+        An early exit is a second taker trade and a second fee; holding to resolution is a
+        SETTLEMENT, not a trade, and pays no exit fee -- so the number of chargeable legs is
+        exactly `2 if EXIT_ENABLE else 1`. Getting this wrong in either direction is worth
+        more than every threshold in this file: at p=0.5 one leg is 1.75c/share."""
         if not (bb and ba) or ba <= bb:
             return None
-        return CFG['RT_SPREAD_MULT'] * (ba - bb) + (CFG['RT_FEE_C'] + CFG['RT_BUFFER_C']) / 100.0
+        fee = 0.0
+        if pay is not None and CFG['FEE_RATE_TAKER'] > 0:
+            legs = 2 if CFG['EXIT_ENABLE'] else 1
+            fee = legs * taker_fee(pay, CFG['FEE_RATE_TAKER'], CFG['FEE_EXPONENT'])
+        return (CFG['RT_SPREAD_MULT'] * (ba - bb) + fee
+                + (CFG['RT_FEE_C'] + CFG['RT_BUFFER_C']) / 100.0)
 
     def _manage_exits(self, now):
         """Close open positions early when the drift scalp is done: take-profit (poly moved
@@ -921,8 +1055,18 @@ class Analytics:
             if now - pos['ts'] < CFG['EXIT_MIN_HOLD_S']: continue   # anti-thrash
             side = pos['side']
             # per-share P&L if we cross the spread to exit right now (entry stored as the
-            # price PAID per held share: BUY=YES ask, SELL=NO cost=1-bid)
-            pnl_ps = (bb - pos['entry']) if side == 'BUY' else ((1 - ba) - pos['entry'])
+            # price PAID per held share: BUY=YES ask, SELL=NO cost=1-bid). Mark against the
+            # book the exit will ACTUALLY hit for the size held -- top-of-book overstates every
+            # scalp exactly where the book is thinnest, and that is where the TP used to fire.
+            held = pos.get('shares') or 0.0
+            if held > 0:
+                sell_px, sellable = self._sell_vwap(side, held)
+                # 0.01 sh is the CLOB's tradable step (Executor._live_sell floors to it): below
+                # that there is no exit to take, so do not manufacture one.
+                if sell_px is None or sellable < 0.01: continue
+            else:                       # size unknown (research/legacy position): top-of-book
+                sell_px = bb if side == 'BUY' else 1 - ba
+            pnl_ps = sell_px - pos['entry']
             reason = None
             if CFG['EXIT_TP_C'] > 0 and pnl_ps >= CFG['EXIT_TP_C'] / 100.0:
                 reason = 'tp'
@@ -941,10 +1085,11 @@ class Analytics:
                     if psig is not None:
                         psig['at_close'] = False
                         psig['eval_ts'] = now
-                        psig['exit_px'] = bb if side == 'BUY' else ba
-                L_sig(f">>> EXIT {reason.upper()} {side} {pos['slug']} "
-                      f"@sell~{(bb if side == 'BUY' else 1 - ba):.3f} entry {pos['entry']:.3f} "
-                      f"| {msg}")
+                        # YES-space, and on the SAME executable mark the exit decision used:
+                        # a BUY sells YES at sell_px, a SELL sells NO at sell_px == YES 1-px
+                        psig['exit_px'] = sell_px if side == 'BUY' else 1 - sell_px
+                L_sig(f">>> EXIT {reason.upper()} {side} {pos['slug']} @sell~{sell_px:.3f} "
+                      f"entry {pos['entry']:.3f} ({pnl_ps*100:+.1f}c/sh) | {msg}")
 
     def _poly_mid_at(self, ts):
         q = FEEDS['poly'].quotes
@@ -1063,6 +1208,28 @@ async def analytics_task():
             if int(time.time()) % CFG['PRINT_EVERY_S'] == 0: AN.report()
         except Exception as e:
             L_err(f"[analytics] {e}")
+
+def maker_worker(period=1.0):
+    """Dedicated thread that owns ALL maker order I/O. It runs OFF the asyncio event loop, so a
+    blocking CLOB round-trip (post/cancel/get_order, tens to hundreds of ms) never stalls the
+    websocket feed readers -- the hazard that made every feed go stale during a live quote
+    (audit M3). It consumes the atomic snapshot the analytics thread publishes and does the
+    HTTP itself. Nothing here touches numpy or the feeds."""
+    import threading
+    while True:
+        time.sleep(period)
+        try:
+            inp = getattr(AN, 'maker_input', None)   # single atomic read of the published dict
+            if MAKER is None or inp is None:
+                continue
+            MAKER.on_tick(inp['fair'], inp['sigma'], inp['tau'], inp['z'],
+                          poly_fresh=inp['fresh'], now=time.time())
+            if EXECUTOR is not None and EXECUTOR.mode == 'live':
+                MAKER.poll_live_fills(time.time())
+            else:
+                MAKER.simulate_paper_fills(time.time())
+        except Exception as e:
+            L_err(f"[maker] worker: {e}")
 
 # ---------------- plot ----------------
 def make_plot():
@@ -1211,50 +1378,114 @@ def _interactive_menu(args):
     args.record = input("record session data? [Y/n]: ").strip().lower() not in ('n', 'no')
     if input("tune indicator settings? (trigger sensitivity) [y/N]: ").strip().lower() in ('y', 'yes'):
         print("  these control HOW OFTEN drift fires. Lower z / lower corr = more signals.")
-        def _num(prompt, cur, cast=float):
+        def _rec(rec):
+            if rec: print(f"      rec: {rec}")
+        def _num(prompt, cur, cast=float, rec=None):
+            _rec(rec)
             v = input(f"  {prompt} [{cur}]: ").strip()
             try: return cast(v) if v else None
             except ValueError: return None
-        def _pick(prompt, cur, choices):
+        def _pick(prompt, cur, choices, rec=None):
+            _rec(rec)
             v = input(f"  {prompt} {choices} [{cur}]: ").strip().lower()
             return v if v in choices else None
+        print("  'rec:' = what the recorded evidence supports. Where it differs from the current")
+        print("  default the reason is given. Enter keeps the default.")
         print("  fair value = where the EXCHANGE says poly should be (drift, no strike needed),")
         print("  the strike binary model, or 'both' = only trade when they agree.")
         args.fair_source = _pick("fair value source (FAIR_SOURCE)", CFG['FAIR_SOURCE'],
-                                 ['drift', 'model', 'both'])
+                                 ['drift', 'model', 'both'],
+                                 rec="both — agreement was the single biggest filter "
+                                     "(+11.4% vs -18.6% EV/$, n=965)")
         print("  which dislocation:  catchup = exchange moved first, poly has not repriced")
         print("                      fade    = poly moved first, exchange did not follow (cheap)")
         args.scenario = _pick("scenario (SCENARIO_MODE)", CFG['SCENARIO_MODE'],
-                              ['both', 'catchup', 'fade'])
-        args.drift_z = _num("robust-z trigger (DRIFT_Z_ALERT)", CFG['DRIFT_Z_ALERT'])
-        args.min_corr = _num("min |corr| to count as leading (MIN_CORR)", CFG['MIN_CORR'])
+                              ['both', 'catchup', 'fade'],
+                              rec="both — on 5 never-seen sessions 'both' beat 'catchup' "
+                                  "(+10.7% vs +8.0%) on 4x the sample; 'catchup' looks fitted")
+        args.drift_z = _num("robust-z trigger (DRIFT_Z_ALERT)", CFG['DRIFT_Z_ALERT'],
+                            rec="2.0 — passes ~21% of ticks (2026-07-24, n=5085). "
+                                "Frequency knob; |z| showed NO monotone link to profit")
+        args.min_corr = _num("min |corr| to count as leading (MIN_CORR)", CFG['MIN_CORR'],
+                             rec="0.15 — but it is a NO-OP: 99.8% of ticks already pass "
+                                 "(1st pctile of |corr| is 0.21). Raise to ~0.45 to bind")
         args.corr_sign = _num("corr sign  1=positive only  0=either(incl. decoupled)  -1=negative",
-                              CFG['CORR_SIGN'], int)
-        args.min_edge = _num("required model edge (MIN_EDGE)", CFG['MIN_EDGE'])
+                              CFG['CORR_SIGN'], int,
+                              rec="1 — the Up leg should co-move POSITIVELY with the exchange")
+        args.min_edge = _num("required model edge (MIN_EDGE)", CFG['MIN_EDGE'],
+                             rec="0.03 — but RT_GATE now adds the real taker fee on top, "
+                                 "so the effective floor is ~0.06 near the money")
+        print("  VOL_Z_MIN is the gate that actually binds: on 2026-07-24 only 9.2% of ticks")
+        print("  cleared 1.5 (it sits ABOVE the 90th percentile of vol_z), and the full taker")
+        print("  chain passed just 2.3% of ticks -> zero signals all session.")
+        args.vol_z_min = _num("min volume z to confirm the move (VOL_Z_MIN)", CFG['VOL_Z_MIN'],
+                              rec="1.5 to stay selective, ~0.0 if you want signals at all "
+                                  "(0.0 passes ~28% of ticks). This is a FREQUENCY choice")
         print("  reward:risk — an 88c share risks $7.30 to make $1, so a 3c edge there is a")
         print("  3.4% return on a 100% downside. This asks the edge to be a minimum FRACTION")
         print("  of what you pay. 0.06 = mild, 0.12 = rejects that 88c/7.5c trade, 0 = off.")
         args.min_edge_roi = _num("min edge as a fraction of price paid (MIN_EDGE_ROI)",
-                                 CFG['MIN_EDGE_ROI'])
+                                 CFG['MIN_EDGE_ROI'],
+                                 rec="0.06 — note the fee is worst on CHEAP shares (6.3% of "
+                                     "capital at 0.10 vs 0.7% at 0.90), which cuts against it")
         print("  vol-spike guard: when the tape accelerates, trailing vol understates the next")
         print("  tau and P_up gets overconfident exactly where shares are dearest.")
         args.vol_spike_guard = _num("vol-spike guard 1=on 0=off (VOL_SPIKE_GUARD)",
-                                    CFG['VOL_SPIKE_GUARD'], int)
+                                    CFG['VOL_SPIKE_GUARD'], int,
+                                    rec="1 — sigma is measured on a 1s grid and under-reads "
+                                        "real vol; being wrong toward 0.5 only costs a skip")
     m = input("trading mode: 1) off - signals only  2) paper  3) live [Enter=1]: ").strip() or '1'
     args.mode = {'1': 'off', '2': 'paper', '3': 'live'}.get(m, 'off')
     if args.mode != 'off':
-        o = input("execution: 1) market - spends stake $ exactly  2) limit - shares at BBO [Enter=1]: ").strip() or '1'
-        args.order = 'limit' if o == '2' else 'market'
-        try: args.stake = float(input("stake per trade, USD [1]: ").strip() or '1')
-        except ValueError: args.stake = 1.0
-        try: args.max_daily_loss = float(input("max daily loss (kill switch), USD [10]: ").strip() or '10')
-        except ValueError: args.max_daily_loss = 10.0
-        ex = input("exit management? scalp: take-profit + thesis-invalidation "
-                   "instead of hold-to-resolution [y/N]: ").strip().lower() in ('y', 'yes')
-        args.exit_mgmt = ex
-        if ex:
-            try: args.exit_tp = float(input("  take-profit, cents/share net of spread [2]: ").strip() or '2')
-            except ValueError: args.exit_tp = 2.0
+        print("  strategy: TAKER crosses the spread on a signal (pays the ~1.75c/share taker")
+        print("  fee, which is larger than the measured taking edge). MAKER rests two-sided")
+        print("  quotes around fair value and pays NO fee, but only earns if it gets filled.")
+        print("      rec: 2 (maker) — net of the real fee every TAKER design was NEGATIVE")
+        print("           (-0.7% pooled / -2.2% holdout); only maker-entry designs were")
+        print("           positive. Neither is proven; maker is the only one that can be.")
+        strat = input("strategy: 1) taker  2) maker (resting quotes) [Enter=1]: ").strip() or '1'
+        if strat == '2':
+            args.maker = True
+            print("  MAKER sizing is in SHARES (exchange min 5), NOT stake $: 5 sh is ~$2.50 of")
+            print("  risk at 0.50. Quotes anchor to the strike model; big |z| = informed flow,")
+            print("  so the bot PULLS its quotes rather than trading into it.")
+            print("      rec: 5 — the exchange minimum. NOTE median top-of-book depth today was")
+            print("           407 shares, so a 5-share quote sits deep in the queue; size does")
+            print("           not improve priority, only price does.")
+            try: args.maker_shares = float(input("  shares to rest per side [5]: ").strip() or '5')
+            except ValueError: args.maker_shares = 5.0
+            print("      rec: 2.5 — pulled on 15.1% of ticks today. LOWER = safer but less")
+            print("           quoting time; the cancel takes ~1.4s to reach the exchange, so")
+            print("           this cannot outrun a fast taker. Verify with scripts/markout.py.")
+            try: args.maker_toxic_z = float(input("  pull all quotes when |robust z| >= this [2.5]: ").strip() or '2.5')
+            except ValueError: args.maker_toxic_z = 2.5
+            print("      rec: 1.0 — heuristic, not fitted. The textbook A-S skew is ~0.0002c")
+            print("           here (numerically dead vs a 1c tick), so this IS the control.")
+            try: args.maker_inv_skew_ticks = float(input("  inventory lean toward offloading, in ticks at the cap [1]: ").strip() or '1')
+            except ValueError: args.maker_inv_skew_ticks = 1.0
+            print("      rec: 10 — covers maker fills too now; a 5-share quote at 0.50 is")
+            print("           $2.50 of risk per side, so $10 is ~4 quotes deep.")
+            try: args.max_daily_loss = float(input("  max daily loss (kill switch), USD [10]: ").strip() or '10')
+            except ValueError: args.max_daily_loss = 10.0
+        else:
+            print("      rec: 1 (market) — limit orders are share-based with a 5-share minimum,")
+            print("           so they ignore your stake and risk 5 x price instead.")
+            o = input("execution: 1) market - spends stake $ exactly  2) limit - shares at BBO [Enter=1]: ").strip() or '1'
+            args.order = 'limit' if o == '2' else 'market'
+            print("      rec: 1 — start at the $1 exchange minimum until markout is measured.")
+            try: args.stake = float(input("stake per trade, USD [1]: ").strip() or '1')
+            except ValueError: args.stake = 1.0
+            try: args.max_daily_loss = float(input("max daily loss (kill switch), USD [10]: ").strip() or '10')
+            except ValueError: args.max_daily_loss = 10.0
+            print("      rec: n — an early exit is a SECOND taker fee (~1.7c/share). Pooled")
+            print("           n=1185, every TP level 2c-20c scored the same, so the level is")
+            print("           not a real knob; holding avoids the second fee.")
+            ex = input("exit management? scalp: take-profit + thesis-invalidation "
+                       "instead of hold-to-resolution [y/N]: ").strip().lower() in ('y', 'yes')
+            args.exit_mgmt = ex
+            if ex:
+                try: args.exit_tp = float(input("  take-profit, cents/share net of spread [2]: ").strip() or '2')
+                except ValueError: args.exit_tp = 2.0
     if args.mode == 'live':
         if _live_creds_prompt():
             os.environ['POLY_DRIFT_ARM'] = 'YES-LIVE'
@@ -1385,7 +1616,11 @@ async def amain(args):
     await asyncio.gather(*tasks)
 
 def main():
-    global AN, RECORDER, EXECUTOR   # EXECUTOR must be module-global: Analytics._signal reads it
+    global AN, RECORDER, EXECUTOR, MAKER   # EXECUTOR must be module-global: Analytics._signal
+    # reads it. MAKER has the IDENTICAL hazard -- Analytics._run_maker reads the module global,
+    # so dropping it from this line builds the quoter in local scope and NO quotes ever rest
+    # (the console still prints "[maker] RESTING QUOTES ON"). This exact bug has bitten
+    # EXECUTOR twice; see FINDINGS.md §6. Guarded by tests/test_menu.py.
     ap = argparse.ArgumentParser()
     ap.add_argument('--token', default=None, help='Polymarket CLOB token_id (fixed-market mode)')
     ap.add_argument('--series', default=None, help='slug substring for auto-roll (e.g. btc-updown-5m); applies 5m preset')
@@ -1446,6 +1681,10 @@ def main():
                          '(CFG MIN_EDGE_ROI, default 0.06; 0 = off). Raises the bar on '
                          'expensive shares, where a small edge is a poor return against a '
                          '100%% downside. Use 0.12 to reject an 88c share with a 7.5c edge')
+    ap.add_argument('--vol-z-min', type=float, default=None,
+                    help='min volume z to confirm a move (CFG VOL_Z_MIN, default 1.5). THE '
+                         'binding gate: measured 2026-07-24 only 9.2%% of ticks cleared 1.5, '
+                         'and the full chain passed 2.3%% -> zero signals. Lower for frequency')
     ap.add_argument('--vol-spike-guard', type=int, choices=[0, 1], default=None,
                     help='1 = never let the model be more confident than the FAST realized-vol '
                          'window justifies (sigma := max(slow, fast)); 0 = trailing window only '
@@ -1454,6 +1693,45 @@ def main():
                     help='conviction override: model edge >= this trades on the model alone, '
                          'bypassing the lead/lag timing gate (CFG EDGE_OVERRIDE, default 0=off; '
                          'try 0.15)')
+    ap.add_argument('--fee-rate', type=float, default=None,
+                    help='taker fee rate for fee = rate*p*(1-p) per share (CFG FEE_RATE_TAKER, '
+                         'default 0.07 = the live crypto_fees_v2 schedule). 0 models the market '
+                         'as fee-free, which it is NOT. Check the live value with '
+                         'scripts/check_fees.py')
+    ap.add_argument('--rt-gate', type=int, choices=[0, 1], default=None,
+                    help='require the edge to clear the live round-trip cost (spread + taker '
+                         'fee + buffer), not just MIN_EDGE (CFG RT_GATE, default 1)')
+    ap.add_argument('--maker', action='store_true',
+                    help='MAKER MODE: rest two-sided limit quotes around model fair value '
+                         'instead of crossing the spread. Makers pay NO taker fee '
+                         '(0.07*p*(1-p), ~1.75c/share at the money) -- that fee is larger than '
+                         'the whole measured taking edge. Disables the taker path. '
+                         'Needs --mode paper|live; live still requires the usual ARM')
+    ap.add_argument('--maker-shares', type=float, default=5.0,
+                    help='shares to rest PER SIDE (exchange minimum 5; at 0.50 that is $2.50 '
+                         'of risk per quote, which is NOT bounded by --stake)')
+    ap.add_argument('--maker-gamma', type=float, default=3.0,
+                    help='Avellaneda-Stoikov risk aversion: higher = wider quotes and a '
+                         'stronger inventory skew (default 3.0)')
+    ap.add_argument('--maker-kappa', type=float, default=100.0,
+                    help='A-S order-arrival intensity: higher = tighter quotes. NOT the '
+                         'textbook ~6: the tick here is 0.01 and the median market spread is '
+                         '1 tick, so kappa~100 is what puts the quote at the touch instead of '
+                         '13c away from it (default 100)')
+    ap.add_argument('--maker-inv-skew-ticks', type=float, default=1.0,
+                    help='how many TICKS the reservation price leans to offload when net '
+                         'inventory hits the cap (default 1.0). The A-S variance skew is '
+                         'numerically dead at this vol, so this is the real inventory control')
+    ap.add_argument('--maker-toxic-z', type=float, default=2.5,
+                    help='pull ALL quotes when |robust z| >= this. Big poly moves are INFORMED '
+                         '(FINDINGS: |z|>=3 was -26%% EV/$ to trade), so as a maker this is the '
+                         'signal to get out of the way, not to trade (default 2.5)')
+    ap.add_argument('--maker-latency-log', default='maker_latency.csv',
+                    help='CSV of every order attempt with its post->ack round trip (ms)')
+    ap.add_argument('--maker-fills-log', default='maker_fills.csv',
+                    help='CSV of every maker FILL with its decision context. This is the input '
+                         'to scripts/markout.py, which measures adverse selection -- the number '
+                         'that decides whether market making here is a business')
     ap.add_argument('--no-state-log', dest='state_log', action='store_false', default=True,
                     help='disable the per-tick market_state.csv research telemetry '
                          '(CFG STATE_LOG; on by default, ~3k rows/hour)')
@@ -1478,6 +1756,8 @@ def main():
                      ('EDGE_OVERRIDE', args.edge_override),
                      ('ENTRY_MAX_PX', args.entry_max_px),
                      ('MIN_EDGE_ROI', args.min_edge_roi),
+                     ('FEE_RATE_TAKER', args.fee_rate), ('RT_GATE', args.rt_gate),
+                     ('VOL_Z_MIN', args.vol_z_min),
                      ('VOL_SPIKE_GUARD', args.vol_spike_guard),
                      ('FAIR_SOURCE', args.fair_source), ('SCENARIO_MODE', args.scenario),
                      ('FADE_TAU_MIN', args.fade_tau_min), ('FADE_TAU_MAX', args.fade_tau_max),
@@ -1510,6 +1790,29 @@ def main():
                    else "exit=off (hold to resolution)")
         L_sess(f"[exec] mode={args.mode} order={args.order} stake=${args.stake:.2f} "
               f"max daily loss=${args.max_daily_loss:.2f} | {ex_desc}")
+    if args.maker:
+        # MAKER MODE. Live orders are placed through EXECUTOR.client, which exists only after
+        # Executor._arm_live() cleared POLY_DRIFT_ARM=YES-LIVE *and* a typed ARM -- so this
+        # flag cannot arm anything by itself. --mode off has no client, hence no quoting.
+        if args.mode == 'off':
+            ap.error('--maker needs --mode paper or --mode live (it places resting orders)')
+        from maker import MakerQuoter, MIN_SHARES
+        want = float(args.maker_shares)
+        if want < MIN_SHARES:
+            L_warn(f"[maker] --maker-shares {want:g} is below the exchange minimum "
+                   f"({MIN_SHARES:g}); using {MIN_SHARES:g}. At 0.50 that is "
+                   f"${MIN_SHARES*0.5:.2f} of risk per quote, NOT your --stake ${args.stake:.2f}.")
+        MAKER = MakerQuoter(EXECUTOR, POLY_BOOK, ROLL, CFG, shares=want,
+                            gamma=args.maker_gamma, kappa=args.maker_kappa,
+                            toxic_z=args.maker_toxic_z,
+                            inv_skew_ticks=args.maker_inv_skew_ticks,
+                            latency_log=args.maker_latency_log,
+                            fills_log=args.maker_fills_log)
+        L_sess(f"[maker] RESTING QUOTES ON. shares={MAKER.shares:g}/side gamma={args.maker_gamma} "
+               f"kappa={args.maker_kappa} toxic_z={args.maker_toxic_z} "
+               f"latency->{args.maker_latency_log} | the taker path (_signal) is DISABLED")
+        # order I/O on its OWN thread so a blocking CLOB round-trip never stalls the feeds
+        threading.Thread(target=maker_worker, daemon=True).start()
     t = threading.Thread(target=lambda: asyncio.run(amain(args)), daemon=True)
     t.start()
     try:

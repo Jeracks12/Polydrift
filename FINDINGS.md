@@ -337,3 +337,133 @@ catchup+agree subset the filter *removed* winners, so it is NOT applied as a def
 `FAIR_SOURCE='both'` and `SCENARIO_MODE='catchup'`. **Operational consequence:** `'both'` needs a
 trusted strike, so the first cycle after startup cannot trade (gate `no_strike`). To trade the
 fade as well, `--scenario both` (+4.9% +/-7.2, n=310 — positive but not significant).
+
+---
+
+## THE FEE. Everything above this line was measured GROSS — 2026-07-23
+
+**Read this before trusting any EV number in this document.** Polymarket charges a taker fee on
+the 5-minute up/down markets. Confirmed live on our own markets (`gamma-api`, btc/eth/sol/xrp):
+
+```
+feeSchedule = {'exponent': 1, 'rate': 0.07, 'takerOnly': True, 'rebateRate': 0.2}
+feeType = crypto_fees_v2   feesEnabled = True
+rewardsMaxSpread = 0       orderMinSize = 5       orderPriceMinTickSize = 0.01
+```
+
+`fee/share = 0.07 * p * (1-p)`, **takers only**. Re-verify with `python scripts/check_fees.py`.
+
+| | per share |
+|---|---|
+| gross edge, `model agrees`, pooled 16 sessions | **+0.78c** |
+| round-trip taker fee at our mean entry prices | **-2.58c** |
+| **net as a taker round-trip** | **-1.80c** |
+
+The fee is bigger than the entire edge, and Polymarket introduced it expressly to neutralise
+latency arbitrage. `scripts/sweep_fees.py` scores four execution designs:
+
+| design | pooled EV/$ | holdout EV/$ |
+|---|---|---|
+| A taker in / taker out — **what the bot did** | -0.7% | -2.2% |
+| B taker in / hold to resolution | -2.5% | -11.7% |
+| C **maker in** / taker out | **+5.4%** | +3.7% |
+| D **maker in** / hold to resolution | +3.3% | -6.7% |
+
+Only maker-entry designs are positive. None is significant. Design C assumes you get filled at
+your resting price, which overstates fills — treat it as an upper bound.
+
+Note also that **EV/$ is the wrong yardstick against a per-share fee**: the fee is
+`rate*(1-p)` as a fraction of capital, i.e. worst on cheap shares (6.3% at p=0.10, 0.7% at
+p=0.90). `MIN_EDGE_ROI` steers toward exactly the entries the fee punishes hardest.
+
+### Statistical correction to the "1,018 candidates" study
+The `catchup + model agrees + TP 3c -> +16.6% (SIG)` headline does not survive:
+- **n=138 was never 138 independent bets** — 138 signals live in **46 cycles / 11 sessions**
+  (3.0 signals per 5-minute cycle, all sharing one binary outcome). Per-cycle EV/$ is +9.3%.
+- Exits were marked **at the mid**; you sell at the bid. Per-signal executable mark: +15.7%.
+- On **5 sessions never used to fit any rule** (they exist in `scratch/candidates.jsonl` but
+  not `scratch/all.jsonl`): **+8.0%**. Every refinement fitted on the study set degraded:
+  `tau<=200s` +23.0% -> +4.4%, `ROI>=0.10` +35.6% -> +6.7% (both worse than no filter).
+  The `ROI>=0.40` cell (+207%) is 8 trades, **4 of them from one cycle**.
+- `SCENARIO_MODE`: the ordering **reverses** out of sample. catchup+agrees +15.7% -> +8.0%;
+  fade+agrees +5.0% -> **+11.4%**; both+agrees +7.8% -> **+10.7%** on 4x the sample.
+  `model agrees` is the real filter; `catchup` looks fitted.
+- **The TP level is not a knob.** Pooled n=1185: TP 2c +9.2%, 3c +8.9%, 5c +9.3%, 12c +9.3%,
+  20c +8.3% — flat across a 10x range. The published TP ladder was mid-mark noise.
+
+### The pricer was miscalibrated, and CALIB_SLOPE was backwards
+`scripts/fit_calibration.py` fits P(up | ln(S/K)/(sigma*sqrt(tau))) on 419,444 rows / 104,861
+real cycles, walk-forward. Out-of-sample Brier:
+
+| model | Brier |
+|---|---|
+| Gaussian `binary_p_up` raw | 0.13063 |
+| + `CALIB_SLOPE=0.9` (the old default) | **0.13271 — WORSE than raw** |
+| + best slope (1.5) | 0.12688 |
+| **EMPIRICAL table** (`CALIB_MODE='empirical'`, new default) | **0.12655** |
+
+The Gaussian is **under-confident in the body**, not overconfident in the tails: at x~+0.7 it
+says 0.760 where 104k cycles say 0.839. `CALIB_SLOPE<1` compresses toward 0.5 and made it
+worse. At +-10bp from the strike — where these markets trade — Phi() and the measured table
+disagree by up to **11 points**, ~4x `MIN_EDGE`.
+
+### Defaults changed 2026-07-23
+`RT_GATE=1` (was 0), `FEE_RATE_TAKER=0.07` (new, was an unmodelled 0), `CALIB_MODE='empirical'`
+(new), `CALIB_SLOPE=1.5` (was 0.9, wrong sign). Exit marks now price the real book depth
+(`_sell_vwap`) instead of top-of-book, and a `thin_book` gate rejects unfillable quotes.
+
+## Maker mode (`--maker`) — new, UNPROVEN
+
+`maker.py` rests two-sided GTC quotes around model fair value. Makers pay **no fee**
+(`takerOnly: True`), so the same model keeps the edge instead of donating it.
+
+**The inversion:** FINDINGS §1 above measured that the harder poly moves against the exchange,
+the more often poly is *right* (`|z|>=3` -> -26% EV/$ to trade). That finding killed the fade
+as a taker; as a maker it is the **toxicity signal**. `--maker-toxic-z` (default 2.5) pulls all
+quotes on a z spike. Same robust-z, opposite sign.
+
+Pricing is Avellaneda-Stoikov with a binary's payoff variance `p(1-p)` as the inventory
+penalty — the same shape as the fee, so both argue for wider quotes near 0.50.
+**`kappa` defaults to 100, not the textbook ~6**: the tick is 0.01 and the median market
+spread is 1 tick, so kappa=6 quotes 0.36/0.64 into a 0.49/0.51 market and never fills.
+
+```bash
+python poly_drift.py --series btc-updown-5m --mode paper --maker --maker-shares 5
+```
+
+Live still requires `POLY_DRIFT_ARM=YES-LIVE` + typed `ARM`; `maker.py` has no path to a
+client except `EXECUTOR.client` and is tested to never read the environment.
+Per-order post->ack latency lands in `maker_latency.csv`.
+
+### Maker audit fixes — 2026-07-23 (all 7 findings closed)
+A senior-quant audit of the maker engine found 2 blockers + 5 issues; all fixed and tested.
+- **M1 (CRITICAL) — no P&L/settlement/kill-switch.** Maker inventory was zeroed at roll with no
+  P&L booked and never touched the daily-loss cap. FIX: `Executor.register_maker_fill()` books
+  each fill as a `strat='maker'` position (bid→BUY/YES, ask→SELL/NO) that settles through the
+  existing `on_roll`/`verify_settlement` path; a matched YES+NO pair nets to spread capture
+  automatically. The cap now trips on realized maker losses.
+- **M3 (HIGH) — blocking HTTP on the asyncio loop.** Order I/O ran inside `AN.compute()` on the
+  event-loop thread, stalling every feed for the round-trip. FIX: `compute()` publishes an
+  atomic `AN.maker_input`; a dedicated `maker_worker` thread does ALL order I/O off the loop.
+- **M2 (HIGH) — partial-fill double count** (`size_matched` is cumulative): book only the delta.
+- **M4 (HIGH) — inventory cap froze the position** (pulled both sides): now per-side, keeps the
+  offloading quote live.
+- **M5 (MED) — A-S skew numerically inert** (~1e-4c vs a 1c tick): inventory skew rescaled to
+  saturate at `--maker-inv-skew-ticks` (default 1 tick) at the cap. Heuristic, not fitted.
+- **M6 (MED) — circular fair.** Quotes now anchor to the strike model `model_p` (independent of
+  the poly mid), not the mid-blended drift fair.
+- **M7 (LOW) — vol-spike guard** now applied to the maker's sigma too.
+
+Residual fixes — 2026-07-23 (all three closed in code):
+- **#1 paper fills now queue-aware.** `simulate_paper_fills` records the size resting AHEAD of us
+  at post time and only fills once the crossing flow has swept that queue. Under-states fills
+  (safe direction). Still a sim — treat paper fill COUNT as a floor, not a forecast, because
+  without the trade tape the sweep size is proxied by the crossing level's resting size.
+- **#2 orphan reconciliation.** `MakerQuoter.reconcile_open_orders(tokens)` runs on every
+  market adoption (incl. the first tick after a restart), cancelling untracked resting orders
+  on OUR market's tokens only — never our own live quotes, never another market's orders.
+- **#3 fee premise instrumented.** Live fills' actual fee is read from the CLOB response
+  (`_fee_from_response`), folded into cost (so daily_pnl/kill-switch see it), accumulated on
+  `Executor.maker_fees_paid`, and screamed about (`!!! MAKER FEE CHARGED`) if ever nonzero.
+  The "makers pay zero" premise now proves or breaks itself automatically on the first live
+  fill — no manual reconciliation needed, though you should still eyeball the first one.
